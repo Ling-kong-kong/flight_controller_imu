@@ -1,0 +1,55 @@
+{
+  "time": "2026-11-17T22:52:53.239490+08:00",
+  "firmware_bin_sha256": "e6f5458df374b9015bfcbc91274447a4f640420b0471ee8e3eba0b147c657179",
+  "protocol": "IMU2 v2, 48-byte paired six-axis, 1000Hz output grid",
+  "software_tests": {
+    "passed": 38,
+    "host_protocol": 20,
+    "native_c_integration": 18,
+    "undefined_behavior_sanitizer": true
+  },
+  "programming_status": "programmed_verified_and_reset_running",
+  "programming_connection": "ST-Link/V2 SWD100kHz, software reset with reset_config none; asserted NRST method timed out",
+  "flash_origin": "0x08000000",
+  "new_image_was_written": true,
+  "hardware_timing_validation": {
+    "method": "SWD snapshot after uninterrupted free-running execution; CPU halted for coherent data read, then reset to leave firmware running",
+    "valid_six_axis_pairs": 55454,
+    "successful_pair_span_seconds": 55.453,
+    "scheduled_grid_period_us": 1000,
+    "missing_pairs": 0,
+    "skipped_timer_ticks": 0,
+    "spi_errors": {
+      "accel": 0,
+      "gyro": 0
+    },
+    "native_cadence_warnings": {
+      "accel": 0,
+      "gyro": 0
+    },
+    "max_timer_isr_entry_lateness_us": 29,
+    "max_accel_age_us": 626,
+    "max_gyro_age_us": 558,
+    "max_source_drdy_time_skew_us": 615,
+    "snapshot_frame_crc_valid": true,
+    "snapshot_frame": {
+      "sequence": 55453,
+      "timestamp_us": 55665000,
+      "ax": -24,
+      "ay": -17,
+      "az": 1347,
+      "gx": 2,
+      "gy": -9,
+      "gz": 5,
+      "accel_age_us": 108,
+      "gyro_age_us": 541,
+      "flags": 0,
+      "tick_late_us": 0
+    },
+    "scope": "Validates board-side scheduled pairing and raw sensor reads; does not prove physical simultaneous conversions or USB delivery rate."
+  },
+  "usb_stream_validation": "not performed; board USB device was not detected and no CDC reader session occurred",
+  "flash_log": "logs/flash-1000hz-software-reset.log",
+  "runtime_log": "logs/runtime-1000hz.log",
+  "runtime_snapshot": "logs/swd-1000hz-snapshot.bin"
+}

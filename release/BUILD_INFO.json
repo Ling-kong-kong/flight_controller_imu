@@ -1,0 +1,103 @@
+{
+  "target": "STM32H743, 16 MHz HSE crystal, LDO, BMI088 SPI3, USB FS CDC",
+  "flash_origin": "0x08000000",
+  "initial_stack": "0x20020000",
+  "reset_vector_thumb": "0x080019D5",
+  "binary_bytes": 27676,
+  "compiler": "arm-none-eabi-gcc (Arm GNU Toolchain 14.3.Rel1 (Build arm-14.174)) 14.3.1 20250623",
+  "source_sha256": "b721dcbbf6413669570ae5d79ed7746bb373d84187d6c58e0b8cc991d16c3fe1",
+  "protocol": "IMU2 v2; 48 bytes; 1000Hz paired raw six-axis output",
+  "software_validation": "ARM Release build and 38 passing host/native C tests",
+  "hardware_validation": {
+    "time": "2026-11-17T22:52:53.239490+08:00",
+    "firmware_bin_sha256": "e6f5458df374b9015bfcbc91274447a4f640420b0471ee8e3eba0b147c657179",
+    "protocol": "IMU2 v2, 48-byte paired six-axis, 1000Hz output grid",
+    "software_tests": {
+      "passed": 38,
+      "host_protocol": 20,
+      "native_c_integration": 18,
+      "undefined_behavior_sanitizer": true
+    },
+    "programming_status": "programmed_verified_and_reset_running",
+    "programming_connection": "ST-Link/V2 SWD100kHz, software reset with reset_config none; asserted NRST method timed out",
+    "flash_origin": "0x08000000",
+    "new_image_was_written": true,
+    "hardware_timing_validation": {
+      "method": "SWD snapshot after uninterrupted free-running execution; CPU halted for coherent data read, then reset to leave firmware running",
+      "valid_six_axis_pairs": 55454,
+      "successful_pair_span_seconds": 55.453,
+      "scheduled_grid_period_us": 1000,
+      "missing_pairs": 0,
+      "skipped_timer_ticks": 0,
+      "spi_errors": {
+        "accel": 0,
+        "gyro": 0
+      },
+      "native_cadence_warnings": {
+        "accel": 0,
+        "gyro": 0
+      },
+      "max_timer_isr_entry_lateness_us": 29,
+      "max_accel_age_us": 626,
+      "max_gyro_age_us": 558,
+      "max_source_drdy_time_skew_us": 615,
+      "snapshot_frame_crc_valid": true,
+      "snapshot_frame": {
+        "sequence": 55453,
+        "timestamp_us": 55665000,
+        "ax": -24,
+        "ay": -17,
+        "az": 1347,
+        "gx": 2,
+        "gy": -9,
+        "gz": 5,
+        "accel_age_us": 108,
+        "gyro_age_us": 541,
+        "flags": 0,
+        "tick_late_us": 0
+      },
+      "scope": "Validates board-side scheduled pairing and raw sensor reads; does not prove physical simultaneous conversions or USB delivery rate."
+    },
+    "usb_stream_validation": "not performed; board USB device was not detected and no CDC reader session occurred",
+    "flash_log": "logs/flash-1000hz-software-reset.log",
+    "runtime_log": "logs/runtime-1000hz.log",
+    "runtime_snapshot": "logs/swd-1000hz-snapshot.bin"
+  },
+  "dependencies": {
+    "format": 1,
+    "dependencies": [
+      {
+        "name": "stm32h7xx_hal_driver",
+        "repository": "STMicroelectronics/stm32h7xx-hal-driver",
+        "version": "v1.11.3",
+        "url": "https://codeload.github.com/STMicroelectronics/stm32h7xx-hal-driver/tar.gz/refs/tags/v1.11.3",
+        "sha256": "1091557529fbcf4a1ae1486b66e9b02ad4d0006307b15b35d8d806fa44fffb3c",
+        "size": 1933167
+      },
+      {
+        "name": "cmsis_device_h7",
+        "repository": "STMicroelectronics/cmsis-device-h7",
+        "version": "v1.10.5",
+        "url": "https://codeload.github.com/STMicroelectronics/cmsis-device-h7/tar.gz/refs/tags/v1.10.5",
+        "sha256": "05d2302fad784c4df593714bc172e65f5a9a4d5095efd92de85879b55680bfee",
+        "size": 5864960
+      },
+      {
+        "name": "cmsis_5",
+        "repository": "ARM-software/CMSIS_5",
+        "version": "5.9.0",
+        "url": "https://codeload.github.com/ARM-software/CMSIS_5/tar.gz/refs/tags/5.9.0",
+        "sha256": "9ce693dd15c41f02506adda79323c077912b3211303ca0d9b28b8ebe735a7031",
+        "size": 40658690
+      },
+      {
+        "name": "tinyusb",
+        "repository": "hathach/tinyusb",
+        "version": "0.18.0",
+        "url": "https://codeload.github.com/hathach/tinyusb/tar.gz/refs/tags/0.18.0",
+        "sha256": "e7fa1bd723213749a0362c79eaccc99e84c8adea8f0a63588c4e4812608b7aa9",
+        "size": 3282996
+      }
+    ]
+  }
+}

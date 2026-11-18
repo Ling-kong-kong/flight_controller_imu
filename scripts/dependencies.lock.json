@@ -1,0 +1,37 @@
+{
+  "format": 1,
+  "dependencies": [
+    {
+      "name": "stm32h7xx_hal_driver",
+      "repository": "STMicroelectronics/stm32h7xx-hal-driver",
+      "version": "v1.11.3",
+      "url": "https://codeload.github.com/STMicroelectronics/stm32h7xx-hal-driver/tar.gz/refs/tags/v1.11.3",
+      "sha256": "1091557529fbcf4a1ae1486b66e9b02ad4d0006307b15b35d8d806fa44fffb3c",
+      "size": 1933167
+    },
+    {
+      "name": "cmsis_device_h7",
+      "repository": "STMicroelectronics/cmsis-device-h7",
+      "version": "v1.10.5",
+      "url": "https://codeload.github.com/STMicroelectronics/cmsis-device-h7/tar.gz/refs/tags/v1.10.5",
+      "sha256": "05d2302fad784c4df593714bc172e65f5a9a4d5095efd92de85879b55680bfee",
+      "size": 5864960
+    },
+    {
+      "name": "cmsis_5",
+      "repository": "ARM-software/CMSIS_5",
+      "version": "5.9.0",
+      "url": "https://codeload.github.com/ARM-software/CMSIS_5/tar.gz/refs/tags/5.9.0",
+      "sha256": "9ce693dd15c41f02506adda79323c077912b3211303ca0d9b28b8ebe735a7031",
+      "size": 40658690
+    },
+    {
+      "name": "tinyusb",
+      "repository": "hathach/tinyusb",
+      "version": "0.18.0",
+      "url": "https://codeload.github.com/hathach/tinyusb/tar.gz/refs/tags/0.18.0",
+      "sha256": "e7fa1bd723213749a0362c79eaccc99e84c8adea8f0a63588c4e4812608b7aa9",
+      "size": 3282996
+    }
+  ]
+}

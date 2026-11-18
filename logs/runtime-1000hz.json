@@ -1,0 +1,42 @@
+{
+  "diagnostics": {
+    "accel_drdy": 90097,
+    "gyro_drdy": 110718,
+    "accel_spi_errors": 0,
+    "gyro_spi_errors": 0,
+    "accel_cadence_warnings": 0,
+    "gyro_cadence_warnings": 0,
+    "output_ticks": 55454,
+    "valid_pairs": 55454,
+    "missing_pairs": 0,
+    "timer_skipped": 0,
+    "ring_drops": 0,
+    "queued_pairs": 0,
+    "usb_frames": 0,
+    "usb_sessions": 0,
+    "high_water_frames": 0,
+    "tick_late_max_us": 29,
+    "accel_age_max_us": 626,
+    "gyro_age_max_us": 558,
+    "pair_skew_max_us": 615,
+    "last_target_low": 55665000,
+    "last_target_high": 0,
+    "last_tick_late_us": 0,
+    "last_frame_sequence": 55453
+  },
+  "frame": {
+    "sequence": 55453,
+    "timestamp_us": 55665000,
+    "ax": -24,
+    "ay": -17,
+    "az": 1347,
+    "gx": 2,
+    "gy": -9,
+    "gz": 5,
+    "accel_age_us": 108,
+    "gyro_age_us": 541,
+    "flags": 0,
+    "tick_late_us": 0
+  },
+  "crc_valid": true
+}
