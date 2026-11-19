@@ -6,12 +6,12 @@
 
 所有源代码、测试、启动脚本、虚拟环境、默认录制与导出目录均位于本目录。程序不导入固件或原有 tools，不需要固件构建产物，不发送串口命令、不修改固件或 CDC 协议。依赖：Python 3.11、PySide6、PyQtGraph、OpenCV、NumPy、pyserial；psutil 用于进程内存观测。
 
-在 PowerShell 中：
+从仓库根目录打开 PowerShell：
 
 ~~~powershell
-cd \flight_controller_imu\viewer
+cd .\viewer
 .\setup.ps1                 # 首次安装，Python 3.11
-.\run.ps1                   # GUI；当前电脑已经安装好环境
+.\run.ps1                   # 启动 GUI
 # 也可双击 run.cmd
 .\run.ps1 devices           # 只列举 USB 身份与相机 PnP 信息
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -90,7 +90,7 @@ cd \flight_controller_imu\viewer
 
 ~~~powershell
 .\run.ps1 record --seconds 605
-.\run.ps1 record --serial-number 003200303333510233353634 --camera 0 --output E:\my_capture --seconds 605
+.\run.ps1 record --serial-number YOUR_USB_SERIAL --camera 0 --output .\my_capture --seconds 605
 .\run.ps1 verify SESSION                  # 原始 USB 重解码、CSV/模型/图像审计
 .\run.ps1 verify SESSION --decode-all     # 另逐张解码全部彩色 PNG
 .\run.ps1 finalize SESSION                # 停止后重建时间索引；旧会话保留原模型审计
