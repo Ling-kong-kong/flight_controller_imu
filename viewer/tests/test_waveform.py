@@ -302,20 +302,70 @@ class WaveformTests(unittest.TestCase):
         QtTest.QTest.mouseDClick(chart.plot.viewport(),QtCore.Qt.LeftButton,pos=pos)
         self.pump()
 
-    def test_expand_half_restore_doubleclick_escape_close_and_shutdown(self):
+    def test_double_click_opens_normal_window_with_native_controls(self):
+        self.panel.all_history()
+        self.panel.set_range(3, 5)
+        self.panel.set_y_ranges([(-.2, .2), (-.5, .5)])
+        for chart in self.panel.charts:
+            with self.subTest(chart=chart.title):
+                self.double_click(chart)
+                window = self.panel.expanded[chart]
+                self.assertTrue(window.isWindow())
+                self.assertTrue(window.isVisible())
+                self.assertFalse(window.isFullScreen())
+                self.assertFalse(window.isMaximized())
+                for flag in (QtCore.Qt.WindowMinimizeButtonHint,
+                             QtCore.Qt.WindowMaximizeButtonHint,
+                             QtCore.Qt.WindowCloseButtonHint):
+                    self.assertTrue(window.windowFlags() & flag)
+                available = window.screen().availableGeometry()
+                self.assertLess(window.width(), available.width())
+                self.assertLess(window.height(), available.height())
+                self.assertIs(window.centralWidget(), chart)
+                window.showMinimized()
+                self.pump()
+                self.assertTrue(window.isMinimized())
+                self.assertIn(chart, self.panel.expanded)
+                window.showMaximized()
+                self.pump()
+                self.assertTrue(window.isMaximized())
+                actions = {action.text(): action for action in window.findChildren(QtGui.QAction)}
+                for name in ('返回主窗口', '回到实时',
+                             '查看全程', '纵轴自动', '纵轴范围…'):
+                    self.assertIn(name, actions)
+                toolbar = window.findChild(QtWidgets.QToolBar)
+                self.assertEqual([action.text() for action in toolbar.actions() if action.text()],
+                                 ['返回主窗口', '回到实时', '查看全程', '纵轴自动', '纵轴范围…'])
+                for name in ('普通窗口', '全屏', '左半屏', '右半屏'):
+                    self.assertNotIn(name, actions)
+                window.showNormal()
+                self.pump()
+                self.assertFalse(window.isMaximized())
+                self.assertFalse(window.isFullScreen())
+                np.testing.assert_allclose(chart.view.viewRange()[0], [3, 5])
+                self.assertFalse(self.panel.follow)
+                actions['返回主窗口'].trigger()
+                self.pump()
+                self.assertNotIn(chart, self.panel.expanded)
+                self.assertIs(chart.parentWidget(), self.panel.places[chart].parentWidget())
+                np.testing.assert_allclose(chart.view.viewRange()[0], [3, 5])
+                self.assertEqual(chart.y_mode.text(), '纵轴手动（固定）')
+
+    def test_expand_restore_doubleclick_escape_close_and_shutdown(self):
         a,g = self.panel.charts
         self.panel.all_history()
         before = a.view.viewRange()[0].copy()
         self.double_click(a)
         w = self.panel.expanded[a]
         self.assertIs(w.centralWidget(),a)
-        self.assertTrue(w.isFullScreen())
-        for right in (False,True):
-            w.half(right)
-            self.pump()
-            rect = w.screen().availableGeometry()
-            self.assertAlmostEqual(w.width(),rect.width()/2,delta=2)
-            self.assertAlmostEqual(w.x(),rect.x()+(rect.width()//2 if right else 0),delta=3)
+        self.assertFalse(w.isFullScreen())
+        self.assertFalse(w.isMaximized())
+        w.showMaximized()
+        self.pump()
+        self.assertTrue(w.isMaximized())
+        w.showNormal()
+        self.pump()
+        np.testing.assert_allclose(before, a.view.viewRange()[0])
         self.wheel(a)
         np.testing.assert_allclose(a.view.viewRange()[0],g.view.viewRange()[0])
         preserved = a.view.viewRange()[0].copy()

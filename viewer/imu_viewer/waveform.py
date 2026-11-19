@@ -201,17 +201,19 @@ class YRangeDialog(QtWidgets.QDialog):
 
 class ExpandedChart(QtWidgets.QMainWindow):
     def __init__(self, deck, chart):
-        super().__init__(deck.window())
+        # An owned top-level window, not a dialog/tool window: retain native
+        # title bar, minimize/maximize controls and main-window shutdown ownership.
+        super().__init__(deck.window(), QtCore.Qt.Window |
+                         QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowSystemMenuHint |
+                         QtCore.Qt.WindowMinimizeButtonHint |
+                         QtCore.Qt.WindowMaximizeButtonHint | QtCore.Qt.WindowCloseButtonHint)
         self.deck, self.chart = deck, chart
         self.setWindowTitle(chart.title + " · H743 波形（Esc 返回）")
         toolbar = self.addToolBar("波形窗口")
         toolbar.setMovable(False)
-        for text, callback in (("全屏", self.showFullScreen),
-                               ("左半屏", lambda: self.half(False)),
-                               ("右半屏", lambda: self.half(True)),
+        for text, callback in (("返回主窗口", self.close),
                                ("回到实时", deck.live), ("查看全程", deck.all_history),
-                               ("纵轴自动", deck.auto_y), ("纵轴范围…", deck.show_ranges),
-                               ("返回主窗口", self.close)):
+                               ("纵轴自动", deck.auto_y), ("纵轴范围…", deck.show_ranges)):
             action = toolbar.addAction(text)
             action.triggered.connect(callback)
         time_controls, self.time_span_spin = deck.make_time_controls()
@@ -220,14 +222,14 @@ class ExpandedChart(QtWidgets.QMainWindow):
         self.setCentralWidget(chart)
         escape = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self)
         escape.activated.connect(self.close)
-
-    def half(self, right):
-        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
-        rect = screen.availableGeometry()
-        middle = rect.left()+rect.width()//2
-        self.showNormal()
-        self.setGeometry(middle if right else rect.left(), rect.top(),
-                         rect.right()-middle+1 if right else rect.width()//2, rect.height())
+        # Start as a comfortably sized ordinary window on the main window's
+        # monitor; native title-bar controls handle minimize/maximize/restore.
+        screen = deck.window().screen() or QtGui.QGuiApplication.primaryScreen()
+        available = screen.availableGeometry()
+        width = min(1120, int(available.width() * .8))
+        height = min(760, int(available.height() * .8))
+        self.setGeometry(available.x() + (available.width()-width)//2,
+                         available.y() + (available.height()-height)//2, width, height)
 
     def closeEvent(self, event):
         self.deck.restore_chart(self)
@@ -479,7 +481,7 @@ class WaveformPanel(QtWidgets.QWidget):
         window = ExpandedChart(self, chart)
         window.placeholder = placeholder
         self.expanded[chart] = window
-        window.showFullScreen()
+        window.show()
 
     def restore_chart(self, window):
         chart = window.chart

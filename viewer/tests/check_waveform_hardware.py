@@ -93,12 +93,22 @@ def main():
             images = connection.metrics["camera_frames"]
             doubleclick(window.accel_chart)
             expanded = window.waveforms.expanded[window.accel_chart]
-            check(expanded.isFullScreen(), "double-click moved chart into full-screen window")
-            for right in (False, True):
-                expanded.half(right)
-                pump(.4)
-                check(abs(expanded.width()-expanded.screen().availableGeometry().width()/2)<3,
-                      "right half-screen" if right else "left half-screen")
+            check(expanded.isVisible() and not expanded.isFullScreen() and not expanded.isMaximized(),
+                  "double-click moved chart into ordinary independent window")
+            check(bool(expanded.windowFlags() & QtCore.Qt.WindowMinimizeButtonHint) and
+                  bool(expanded.windowFlags() & QtCore.Qt.WindowMaximizeButtonHint),
+                  "independent window has native minimize/maximize controls")
+            actions = {action.text(): action for action in expanded.findChildren(QtGui.QAction)}
+            check(not {'普通窗口', '全屏', '左半屏', '右半屏'}.intersection(actions),
+                  "normal/full-screen/half-screen toolbar actions removed")
+            check(expanded.findChild(QtWidgets.QToolBar).actions()[0].text() == "返回主窗口",
+                  "return-to-main is the first toolbar action")
+            expanded.showMaximized()
+            pump(.3)
+            check(expanded.isMaximized(), "native maximize state")
+            expanded.showNormal()
+            pump(.3)
+            check(not expanded.isMaximized() and not expanded.isFullScreen(), "normal window restored")
             chart = window.accel_chart
             pos = chart.plot.mapFromScene(chart.view.sceneBoundingRect().center())
             before = chart.view.viewRange()[0].copy()
