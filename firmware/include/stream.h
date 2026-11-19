@@ -52,7 +52,7 @@ typedef struct {
     uint32_t fusion_resets;
 } imu_diagnostics_t;
 
-/* Counters are also available via SWD; no text/status is mixed into USB data. */
+/* Counters are also available via SWD; no text is mixed into USB data (binary control replies are permitted). */
 extern volatile imu_diagnostics_t g_imu_diagnostics;
 extern volatile uint8_t g_last_imu_frame[IMU_FRAME_SIZE];
 

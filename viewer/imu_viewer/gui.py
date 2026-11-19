@@ -107,6 +107,7 @@ class Window(QtWidgets.QMainWindow):
         self.busy = False
         self.last_rates = None
         self.next_diag = 0
+        self._calibration_state = None
         self.bridge = Bridge()
         self.bridge.result.connect(self.job_result)
         self._last_preview_image = None
@@ -115,7 +116,7 @@ class Window(QtWidgets.QMainWindow):
         self.setCentralWidget(main)
         layout = QtWidgets.QVBoxLayout(main)
         layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
         header = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("H743 / STEREO + IMU")
         title.setStyleSheet("font-size:19px;font-weight:700;color:#75d9cd")
@@ -174,6 +175,15 @@ class Window(QtWidgets.QMainWindow):
                   self.stop_button, self.export_button):
             actions.addWidget(w)
         layout.addLayout(actions)
+        calibration_row = QtWidgets.QHBoxLayout()
+        self.recalibrate_button = QtWidgets.QPushButton("重新校准 IMU")
+        self.recalibrate_button.setToolTip("不重启设备；重新估计陀螺零偏 / 重力倾角，并将相对 yaw 归零。原始录制继续。")
+        self.recalibrate_button.clicked.connect(self.recalibrate_imu)
+        self.calibration_status = QtWidgets.QLabel("重新校准：未连接")
+        self.calibration_status.setWordWrap(True)
+        calibration_row.addWidget(self.recalibrate_button)
+        calibration_row.addWidget(self.calibration_status, 1)
+        layout.addLayout(calibration_row)
         self.settings_panel = QtWidgets.QWidget()
         settings = QtWidgets.QGridLayout(self.settings_panel)
         settings.setContentsMargins(0, 0, 0, 0)
@@ -322,6 +332,52 @@ class Window(QtWidgets.QMainWindow):
         ready = connected and self.connection.metrics["camera_frames"] > 0 and self.connection.metrics["imu_frames"] > 0
         self.start_button.setEnabled(bool(ready and not saving and not stopping and not self.busy and not self.closing))
         self.stop_button.setEnabled(saving and not self.recorder.stop_event.is_set() and not self.closing)
+        self.update_calibration()
+
+    def update_calibration(self):
+        connection = self.connection
+        snapshot = connection.calibration_snapshot() if connection else dict(state="disconnected", busy=False, masked=False)
+        state = snapshot["state"]
+        labels = {
+            "idle": "待命 · 请先将板卡放稳",
+            "queued": "请求已排队 · 等待发送",
+            "awaiting_ack": "已发送 · 等待板端执行确认（不是校准完成）",
+            "calibrating": "板端已执行 · 请持续静置约 2.2 秒，等待姿态有效",
+            "waiting_stationary": "仍在等待有效姿态 · 运动会延迟校准，请保持静置",
+            "completed": "已完成 · 姿态有效，相对 yaw 已重新归零",
+            "ack_timeout": "未收到执行确认 · 旧固件可能不支持，结果未知；不自动重试，请检查固件 / 连接",
+            "disconnected": "未连接 / 已中断 · 不代表校准完成",
+        }
+        text = labels.get(state, state)
+        self.calibration_status.setText("重新校准：" + text)
+        key = (id(connection), state, snapshot.get("request_id"))
+        if key != self._calibration_state:
+            if state not in ("idle", "disconnected"):
+                self.log.appendPlainText("重新校准 IMU：" + text)
+            self._calibration_state = key
+        ready = connection is not None and connection.metrics["imu_frames"] > 0
+        self.recalibrate_button.setEnabled(bool(ready and not connection.stop_event.is_set()
+                                               and not snapshot["busy"] and not self.closing))
+        return snapshot
+
+    def recalibrate_imu(self):
+        connection = self.connection
+        if not self.recalibrate_button.isEnabled() or connection is None:
+            return
+        answer = QtWidgets.QMessageBox.question(self, "重新校准 IMU",
+            "请先将板卡放稳。确认后重新估计陀螺零偏和重力倾角，静置约 2.2 秒后恢复有效姿态；"
+            "运动时会延迟完成。相对 yaw 将归零，不能与之前的航向基准直接拼接。\n"
+            "不重启 MCU，不中断原始六轴采集或录制。是否继续？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            connection.request_recalibration()
+            snapshot = self.update_calibration()
+            self.attitude_panel.refresh(connection.attitude_history,
+                                        not connection.stop_event.is_set(), snapshot["masked"])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "无法重新校准", str(exc))
 
     def connect_devices(self):
         if self.connection is not None:
@@ -418,7 +474,8 @@ class Window(QtWidgets.QMainWindow):
         if diag:
             self.next_diag = now + 2
         s = r.snapshot()
-        self.attitude_panel.refresh(r.attitude_history, not r.stop_event.is_set())
+        calibration = self.update_calibration()
+        self.attitude_panel.refresh(r.attitude_history, not r.stop_event.is_set(), calibration["masked"])
         # Keep the old connection history if a new device attempt fails before
         # producing both streams. Once ready, this connection owns the history.
         if s["camera_frames"] and s["imu_frames"] and self.waveforms.history is not r.history:

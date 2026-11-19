@@ -20,6 +20,7 @@ MAGIC = b"IMU2"
 VERSION = 2
 FRAME_SIZE = 48
 FRAME_STRUCT = struct.Struct("<4sBBHIQhhhhhhIIHHI")
+CONTROL = struct.Struct("<4sBBHIIQII")
 FRAME_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
 ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 LEGACY_MAGIC = b"IMU1"
@@ -112,6 +113,19 @@ class PairedFrame:
         return data[:-4] + struct.pack("<I", zlib.crc32(data[:-4]))
 
 
+@dataclass(frozen=True)
+class ControlReply:
+    request_id: int
+    status: int
+    timestamp_us: int
+    sequence: int
+
+    def encode(self) -> bytes:
+        data = CONTROL.pack(MAGIC, 1, 0x11, CONTROL.size, self.request_id,
+                            self.status, self.timestamp_us, self.sequence, 0)
+        return data[:-4] + struct.pack("<I", zlib.crc32(data[:-4]))
+
+
 class StreamParser:
     """Incremental decoder. Internal storage is bounded even for a huge feed()."""
 
@@ -124,9 +138,12 @@ class StreamParser:
         self.crc_errors = 0
         self.header_errors = 0
         self.frames = 0
+        self.control_replies = 0
+        self.records = []
 
     def feed(self, data: bytes) -> list[Frame | PairedFrame]:
         self.bytes_received += len(data)
+        self.records = []
         result: list[Frame | PairedFrame] = []
         for start in range(0, len(data), self.BUFFER_LIMIT - FRAME_V3.size):
             self.buffer.extend(data[start:start + self.BUFFER_LIMIT - FRAME_V3.size])
@@ -151,9 +168,12 @@ class StreamParser:
                 return
             paired = self.buffer[:4] == MAGIC
             version = self.buffer[4]
+            control = paired and version == 1 and self.buffer[5] == 0x11
             size = (FRAME_V3.size if version == 3 else FRAME_SIZE) if paired else LEGACY_FRAME_SIZE
             valid_version = version in (2, 3) if paired else version == 1
             valid_type = self.buffer[5] == 3 if paired else self.buffer[5] in SENSOR_NAMES
+            if control:
+                size, valid_version, valid_type = CONTROL.size, True, True
             if (not valid_version or not valid_type
                     or struct.unpack_from("<H", self.buffer, 6)[0] != size):
                 self.header_errors += 1
@@ -166,6 +186,12 @@ class StreamParser:
                 self.crc_errors += 1
                 self._discard(1)
                 continue
+            if control:
+                fields = CONTROL.unpack_from(self.buffer)
+                self.records.append(ControlReply(*fields[4:-1]))
+                self.control_replies += 1
+                del self.buffer[:size]
+                continue
             if paired:
                 fields = (FRAME_V3 if version == 3 else FRAME_STRUCT).unpack_from(self.buffer)
                 result.append(PairedFrame(*fields[4:16], protocol_version=version,
@@ -174,12 +200,13 @@ class StreamParser:
                 fields = LEGACY_FRAME_STRUCT.unpack_from(self.buffer)
                 result.append(Frame(fields[2], fields[4], fields[5],
                                     fields[6], fields[7], fields[8], fields[9]))
+            self.records.append(result[-1])
             del self.buffer[:size]
             self.frames += 1
 
     def summary(self) -> dict:
         return {"bytes_received": self.bytes_received, "valid_frames": self.frames,
-                "bytes_discarded": self.bytes_discarded,
+                "control_replies": self.control_replies, "bytes_discarded": self.bytes_discarded,
                 "crc_errors": self.crc_errors, "header_errors": self.header_errors,
                 "trailing_bytes": len(self.buffer)}
 

@@ -5,6 +5,7 @@
 
 static fusion_t state;
 void replay_reset(void) { memset(&state, 0, sizeof(state)); fusion_reset(&state); }
+void replay_recalibrate(void) { fusion_reset(&state); }
 unsigned replay_update(uint64_t t, const int16_t *a, const int16_t *g,
                        uint32_t aa, uint32_t ga, uint16_t flags)
 {

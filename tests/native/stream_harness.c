@@ -13,7 +13,8 @@
 static uint8_t output[1024u * 1024u];
 static uint32_t output_size;
 static uint32_t capacity;
-static uint32_t rx_pending;
+static uint32_t rx_pending, rx_offset;
+static uint8_t rx_data[4096];
 static uint32_t clears;
 static uint32_t flushes;
 static uint64_t now;
@@ -46,7 +47,8 @@ uint32_t tud_cdc_available(void) { return rx_pending; }
 uint32_t tud_cdc_read(void *buffer, uint32_t count)
 {
     const uint32_t copied = (count < rx_pending) ? count : rx_pending;
-    memset(buffer, 0, copied);
+    memcpy(buffer, rx_data+rx_offset, copied);
+    rx_offset += copied;
     rx_pending -= copied;
     return copied;
 }
@@ -91,7 +93,11 @@ void mock_reset(void)
 void mock_connected(bool value) { connected = value; }
 void mock_suspended(bool value) { suspended = value; }
 void mock_partial_write(bool value) { partial_write = value; }
-void mock_set_rx(uint32_t value) { rx_pending = value; }
+void mock_set_rx(uint32_t value) { memset(rx_data,0,sizeof(rx_data)); rx_offset=0; rx_pending = value; }
+void mock_rx_data(const uint8_t *data, uint32_t size) {
+    if (size > sizeof(rx_data)) abort();
+    memcpy(rx_data,data,size); rx_offset=0; rx_pending=size;
+}
 uint32_t mock_get_rx(void) { return rx_pending; }
 uint32_t mock_get_clears(void) { return clears; }
 uint32_t mock_get_flushes(void) { return flushes; }

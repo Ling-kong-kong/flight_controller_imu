@@ -26,19 +26,20 @@ class AttitudePanel(QtWidgets.QWidget):
                        for c,n in zip(("#ffb454", "#7edbaf", "#78b9ff"), ("roll", "pitch", "yaw"))]
         layout.addWidget(self.plot, 1)
 
-    def refresh(self, history=None, connected=False):
+    def refresh(self, history=None, connected=False, recalibrating=False):
         if history is not None:
             self.history = history
         if self.history is None:
             return
         f, live, rows = self.history.snapshot(connected)
-        valid = live and f is not None and f.attitude_valid
+        valid = live and f is not None and f.attitude_valid and not recalibrating
         if valid:
             self.state.setText("姿态：有效 · 相对航向")
             self.values.setText(f"roll / pitch / yaw：{f.roll_deg:.2f} / {f.pitch_deg:.2f} / {f.yaw_deg:.2f} °")
             self.quaternion.setText("四元数 qw,qx,qy,qz：" + ", ".join(f"{v:.6f}" for v in (f.qw,f.qx,f.qy,f.qz)))
         else:
-            state = ("中断 / 未连接" if not live else "旧 v2 无姿态" if f.protocol_version != 3
+            state = ("中断 / 未连接" if not live else "重新校准待确认 / 进行中" if recalibrating
+                     else "无数据" if f is None else "旧 v2 无姿态" if f.protocol_version != 3
                      else "校准中（请静置）" if f.flags & 1024 else "无效")
             self.state.setText("姿态：" + state)
             self.values.setText("roll / pitch / yaw：— / — / — °")

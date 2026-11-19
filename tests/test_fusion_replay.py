@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from tools import imu_fusion_replay as replay
-from tools.imu_capture import ATTITUDE_FIELDS, Frame, PairedFrame
+from tools.imu_capture import ATTITUDE_FIELDS, ControlReply, Frame, PairedFrame
 
 
 class FusionReplayTests(unittest.TestCase):
@@ -117,6 +117,29 @@ class FusionReplayTests(unittest.TestCase):
         self.assertEqual(result['input_sequence_regressions'], 0)
         self.assertEqual(result['validity_transition_count'], 2)
 
+    def test_manual_ack_boundary_excludes_old_backlog_and_duplicate_is_not_reset(self):
+        boundary = 2304
+        ack = ControlReply(73, 0, self.frame(boundary).timestamp_us, boundary)
+        records = [self.frame(i) for i in range(2300)]
+        # ACK can overtake old sensor frames in the TX queue. Their valid
+        # attitude must survive replay until the actual executed reset sample.
+        records += [ack] + [self.frame(i) for i in range(2300, 4600)]
+        records += [ack] + [self.frame(i) for i in range(4600, 4700)]
+        original = self.write_frames(records)
+        results = [replay.replay(self.source, self.native, chunk_size=size)
+                   for size in (1, 17, 65536)]
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0], results[2])
+        result = results[0]
+        self.assertEqual(result['paired_frames'], 4700)
+        self.assertEqual(result['manual_recalibrations_applied'], 1)
+        self.assertEqual(result['fusion_resets_including_initial'], 2)
+        self.assertEqual(result['valid_frames'], 302)
+        self.assertEqual(result['input_sequence_missing'], 0)
+        self.assertEqual([x['frame_index'] for x in result['validity_transitions']],
+                         [0, 2199, 2304, 4503])
+        self.assertEqual(self.source.read_bytes(), original)
+
     def test_unpaired_legacy_input_fails_without_fabricating_pairs(self):
         self.source.write_bytes(Frame(1, 1, 100000, 0, 0, 1365).encode())
         with self.assertRaisesRegex(ValueError, 'No paired IMU2'):
@@ -136,5 +159,3 @@ class FusionReplayTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
-\n

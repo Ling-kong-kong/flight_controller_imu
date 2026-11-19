@@ -1,4 +1,4 @@
-"""Independent, bounded IMU2 v2/v3 decoder. No firmware imports or writes."""
+"""Independent, bounded IMU2 v2/v3 decoder. Data frames plus CRC-protected calibration control."""
 from dataclasses import dataclass, asdict
 import math
 import struct
@@ -6,6 +6,7 @@ import zlib
 
 PACKET = struct.Struct("<4sBBHIQhhhhhhIIHHI")
 PACKET_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
+CONTROL = struct.Struct("<4sBBHIIQII")
 ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 FLAGS = {1: "output_timing", 2: "accel_spi_error", 4: "gyro_spi_error",
          8: "ring_overflow", 16: "session_start", 32: "accel_stale",
@@ -75,15 +76,40 @@ class Frame:
         b = packet.pack(b"IMU2", self.protocol_version, 3, packet.size, *values, 0)
         return b[:-4] + struct.pack("<I", zlib.crc32(b[:-4]))
 
+@dataclass(frozen=True)
+class ControlReply:
+    request_id: int
+    status: int
+    timestamp_us: int
+    sequence: int
+
+    def encode(self):
+        return _control_packet(0x11, self.request_id, self.status, self.timestamp_us, self.sequence)
+
+
+def _control_packet(kind, request_id, value, timestamp_us=0, sequence=0):
+    raw = CONTROL.pack(b"IMU2", 1, kind, CONTROL.size, request_id, value,
+                       timestamp_us, sequence, 0)
+    return raw[:-4] + struct.pack("<I", zlib.crc32(raw[:-4]))
+
+
+def recalibrate_command(request_id):
+    if not 0 < request_id <= 0xffffffff:
+        raise ValueError("Nonzero uint32 request ID required")
+    return _control_packet(0x10, request_id, 1)
+
+
 class Parser:
     def __init__(self):
         self.buffer = bytearray()
+        self.records = []
         self.stats = dict(bytes_received=0, bytes_discarded=0,
-                          crc_errors=0, header_errors=0, frames=0)
+                          crc_errors=0, header_errors=0, frames=0, control_replies=0)
 
     def feed(self, data):
         self.stats["bytes_received"] += len(data)
         result = []
+        self.records = []
         # Drain per chunk: storage remains below 4096 bytes even on huge input.
         for start in range(0, len(data), 4000):
             self.buffer.extend(data[start:start + 4000])
@@ -95,11 +121,11 @@ class Parser:
                 self._discard(i)
                 if len(self.buffer) < 8:
                     break
-                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00"):
+                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00", b"\x01\x11\x20\x00"):
                     self.stats["header_errors"] += 1
                     self._discard(1)
                     continue
-                codec = PACKET_V3 if self.buffer[4] == 3 else PACKET
+                codec = CONTROL if self.buffer[4] == 1 else (PACKET_V3 if self.buffer[4] == 3 else PACKET)
                 if len(self.buffer) < codec.size:
                     break
                 packet = bytes(self.buffer[:codec.size])
@@ -109,8 +135,13 @@ class Parser:
                     self._discard(1)
                     continue
                 del self.buffer[:codec.size]
+                if codec is CONTROL:
+                    self.records.append(ControlReply(*fields[4:-1]))
+                    self.stats["control_replies"] += 1
+                    continue
                 result.append(Frame(*fields[4:16], protocol_version=fields[1],
                                     **(dict(zip(ATTITUDE_FIELDS, fields[16:-1])) if fields[1] == 3 else {})))
+                self.records.append(result[-1])
                 self.stats["frames"] += 1
         return result
 

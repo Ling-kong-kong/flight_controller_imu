@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import time
 import cv2
-from .protocol import Frame
+from .protocol import Frame, Parser, ControlReply
 from .clock import WARNING, fit_clock, align_camera
 from .timing import HOST_WARNING, TIME_BASIS, iter_host_imu, match_images, image_filename
 
@@ -47,6 +47,9 @@ class SessionWriter:
         self.handles = []
         self.samples = self.batches = self.images = self.raw_bytes = 0
         self.closed = False
+        self.control_parser = Parser()
+        self.yaw_pending = None
+        self.last_control = None
         try:
             for name in ("cam0", "cam1"):
                 (self.path / name).mkdir()
@@ -56,6 +59,7 @@ class SessionWriter:
                 attitude_coordinates=dict(body="FRD", world="NED", quaternion="qw,qx,qy,qz body-to-world",
                                           euler="3-2-1 roll,pitch,yaw degrees"),
                 attitude_heading="relative yaw zeroed at stationary calibration; drift allowed; no magnetometer",
+                manual_recalibration="IMU2 control v1/32 bytes; executed ACK is not completion; events.jsonl records yaw reference boundaries; raw six-axis and timestamps continue",
                 attitude_installation="provisional ROTATION_PITCH_180; physical axes NOT yet verified",
                 attitude_invalid="attitude_valid=0; quaternion and Euler CSV columns blank",
                 config=asdict(config), state="recording",
@@ -93,6 +97,27 @@ class SessionWriter:
 
     def usb(self, batch_id, raw, start, end, frames):
         self.raw.write(raw)
+        self.control_parser.feed(raw)
+        for record in self.control_parser.records:
+            if isinstance(record, ControlReply):
+                key = (record.request_id, record.timestamp_us, record.sequence)
+                if key == self.last_control:
+                    continue  # Cached ACK retry is not another yaw-reference change.
+                self.last_control = key
+                self.event("imu_recalibration_executed", dict(request_id=record.request_id,
+                           status=record.status, timestamp_us=record.timestamp_us, sequence=record.sequence))
+                if record.status == 0:
+                    self.yaw_pending = dict(request_id=record.request_id, timestamp_us=record.timestamp_us,
+                                            sequence=record.sequence)
+            elif record.protocol_version == 3:
+                if record.flags & (1024 | 4096) and self.yaw_pending is None:
+                    self.yaw_pending = dict(request_id=None, timestamp_us=record.timestamp_us,
+                                            sequence=record.sequence)
+                if (self.yaw_pending is not None and record.attitude_valid and
+                        record.timestamp_us >= self.yaw_pending["timestamp_us"]):
+                    self.event("imu_yaw_reference_valid", dict(boundary=self.yaw_pending,
+                               first_valid_timestamp_us=record.timestamp_us, first_valid_sequence=record.sequence))
+                    self.yaw_pending = None
         self.batch.writerow(dict(zip(BATCH_FIELDS, (
             batch_id, self.raw_bytes, len(raw), start, end, len(frames),
             frames[-1].timestamp_us * 1000 if frames else ""))))

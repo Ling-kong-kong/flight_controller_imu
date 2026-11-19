@@ -1,4 +1,4 @@
-"""Read-only producers, bounded writer queues, and explicit failure lifecycle."""
+"""Single-owner device producers, bounded writer queues, and explicit failure lifecycle."""
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, replace
@@ -17,7 +17,7 @@ import serial
 from serial.tools import list_ports
 from .clock import fit_clock
 from .timing import HOST_WARNING as WARNING, TIME_BASIS
-from .protocol import Parser, Continuity
+from .protocol import Parser, Continuity, Frame
 from .storage import SessionWriter, finalize, json_write
 
 BASE = Path(__file__).resolve().parents[1]
@@ -202,13 +202,14 @@ class Recorder:
 
     def _usb(self):
         try:
-            # No write() calls, commands, flush/reset input, or firmware dependencies.
+            # This thread is the only serial owner. No input flush or MCU reset.
             with serial.Serial(self.config.port, baudrate=115200, timeout=0.2,
                                write_timeout=0.2, rtscts=False, dsrdtr=False) as port:
                 port.dtr = True
                 last_data = time.perf_counter()
                 batch_id = 0
                 while not self.stop_event.is_set():
+                    self._service_commands(port)
                     start = time.perf_counter_ns()
                     raw = port.read(max(1, min(port.in_waiting, 4096)))
                     end = time.perf_counter_ns()
@@ -222,6 +223,14 @@ class Recorder:
                     batch_id += 1
         except Exception as exc:
             self.fail(f"USB: {type(exc).__name__}: {exc}")
+        finally:
+            self._commands_disconnected()
+
+    def _service_commands(self, port):
+        pass
+
+    def _commands_disconnected(self):
+        pass
 
     def _receive_usb(self, batch_id, raw, start, end):
         if start < 0 or end < start or (self.usb_last_ns is not None and start < self.usb_last_ns):
@@ -346,7 +355,10 @@ class Recorder:
                         item = self.usb_q.get_nowait()
                     except queue.Empty:
                         break
-                    self.writer.usb(*item)
+                    if item[0] == "event":
+                        self.writer.event(item[1], item[2])
+                    else:
+                        self.writer.usb(*item)
                     work = True
                 while pending and pending[0].done():
                     self.writer.commit_image(pending.popleft().result())
@@ -481,7 +493,7 @@ class Recorder:
 
 
 class LiveConnection(Recorder):
-    """One read-only device connection with an optional independently drained sink.
+    """One device connection with an optional independently drained sink.
 
     Preview retains only bounded in-memory histories. Attaching/detaching a recording
     never reopens devices, resets their clocks, flushes USB, or sends commands.
@@ -495,10 +507,50 @@ class LiveConnection(Recorder):
         self.routing_lock = threading.RLock()
         self.recording = None
         self.identity = None
+        from .recalibration import Recalibration
+        self.recalibration = Recalibration()
 
     def _waveform_frames(self, frames):
         self.history.append_frames(frames)
-        self.attitude_history.append_frames(frames)
+        display = []
+        for record in self.parser.records:
+            self.recalibration.accept(record)
+            if isinstance(record, Frame):
+                display.append(replace(record, flags=record.flags & ~2048)
+                               if self.recalibration.masked else record)
+        self.attitude_history.append_frames(display)
+        self._calibration_events()
+
+    def _calibration_events(self):
+        sink = self.recording
+        for event in self.recalibration.drain_events():
+            if sink is not None and sink.accepting and not sink.stop_event.is_set():
+                sink.enqueue(sink.usb_q, ("event", "imu_recalibration", event))
+
+    def request_recalibration(self):
+        with self.routing_lock:
+            if self.stop_event.is_set() or not self.metrics["imu_frames"]:
+                raise RuntimeError("Wait for live IMU data")
+            request_id = self.recalibration.request()
+            self._calibration_events()
+            return request_id
+
+    def calibration_snapshot(self):
+        with self.routing_lock:
+            return self.recalibration.snapshot()
+
+    def _service_commands(self, port):
+        with self.routing_lock:
+            self.recalibration.tick()
+            command = self.recalibration.command()
+            self._calibration_events()
+        if command is not None and port.write(command) != len(command):
+            raise OSError("Incomplete IMU recalibration command; outcome unknown")
+
+    def _commands_disconnected(self):
+        with self.routing_lock:
+            self.recalibration.disconnect()
+            self._calibration_events()
 
     def start(self):
         self.identity = select_port(self.config.port, self.config.serial_number)
@@ -534,6 +586,8 @@ class LiveConnection(Recorder):
                                                name="recording-sink-lifecycle", daemon=True)
             sink.controller.start()
             self.recording = sink
+            sink.enqueue(sink.usb_q, ("event", "imu_recalibration_context",
+                                     self.recalibration.snapshot()))
             return sink
 
     def stop_recording(self):

@@ -104,6 +104,7 @@ class LayoutTests(unittest.TestCase):
             window.connection = SimpleNamespace(
                 snapshot=lambda **kw: snapshot, lock=threading.Lock(),
                 latest_image=None, done=done, attitude_history=AttitudeHistory(),
+                metrics=snapshot, calibration_snapshot=lambda: dict(state="disconnected", busy=False, masked=False),
                 stop_event=done, error=snapshot['error'])
             window.next_diag = float('inf')
             window.show()

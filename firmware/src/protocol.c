@@ -73,3 +73,42 @@ void imu_encode_frame(uint8_t frame[76], uint32_t sequence, uint64_t timestamp_u
     }
     put32(frame+72,crc^UINT32_MAX);
 }
+
+static uint32_t get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
+}
+
+static uint32_t control_crc(const uint8_t *p)
+{
+    uint32_t crc = UINT32_MAX;
+    for (unsigned i=0; i<28u; ++i) {
+        crc ^= p[i];
+        for (unsigned bit=0; bit<8u; ++bit)
+            crc = (crc>>1) ^ ((crc&1u) ? 0xEDB88320u : 0u);
+    }
+    return crc ^ UINT32_MAX;
+}
+
+bool imu_decode_recalibrate(const uint8_t frame[32], uint32_t *request_id)
+{
+    static const uint8_t header[8] = {'I','M','U','2',1,0x10,32,0};
+    if (memcmp(frame, header, sizeof(header)) != 0 || get32(frame+8)==0u ||
+        get32(frame+12)!=1u || get32(frame+16)!=0u || get32(frame+20)!=0u ||
+        get32(frame+24)!=0u || get32(frame+28)!=control_crc(frame)) return false;
+    *request_id = get32(frame+8);
+    return true;
+}
+
+void imu_encode_control_reply(uint8_t frame[32], uint32_t request_id,
+                              uint64_t timestamp_us, uint32_t sequence)
+{
+    const uint8_t header[8] = {'I','M','U','2',1,0x11,32,0};
+    memcpy(frame,header,sizeof(header));
+    put32(frame+8,request_id);
+    put32(frame+12,0u); /* Executed, NOT calibration complete. */
+    put32(frame+16,(uint32_t)timestamp_us);
+    put32(frame+20,(uint32_t)(timestamp_us>>32));
+    put32(frame+24,sequence);
+    put32(frame+28,control_crc(frame));
+}

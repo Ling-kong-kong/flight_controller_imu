@@ -21,9 +21,9 @@ import subprocess
 import tempfile
 
 try:
-    from .imu_capture import ATTITUDE_FIELDS, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
+    from .imu_capture import ATTITUDE_FIELDS, ControlReply, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
 except ImportError:
-    from imu_capture import ATTITUDE_FIELDS, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
+    from imu_capture import ATTITUDE_FIELDS, ControlReply, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,6 +76,8 @@ class NativeFusion:
             self.lib.replay_resets.argtypes = []
             self.lib.replay_values.argtypes = [ctypes.POINTER(ctypes.c_float)]
             self.lib.replay_resets.restype = ctypes.c_uint
+            self.lib.replay_recalibrate.argtypes = []
+            self.lib.replay_recalibrate.restype = None
             self.lib.replay_reset()
         except BaseException:
             self.close()
@@ -139,9 +141,19 @@ def replay(path, native, writer=None, chunk_size=65536):
     transitions = []  # bounded even for a damaged/long capture
     transition_count = 0
     last_values = None
+    pending_boundary = None
+    last_control = None
+    manual_resets = 0
     with Path(path).open('rb') as handle:
         for chunk in iter(lambda: handle.read(chunk_size), b''):
-            for f in parser.feed(chunk):
+            parser.feed(chunk)
+            for f in parser.records:
+                if isinstance(f, ControlReply):
+                    key = (f.request_id, f.timestamp_us, f.sequence)
+                    if f.status == 0 and key != last_control:
+                        pending_boundary = f.timestamp_us
+                        last_control = key
+                    continue
                 if not isinstance(f, PairedFrame):
                     nonpaired += 1
                     continue
@@ -151,6 +163,10 @@ def replay(path, native, writer=None, chunk_size=65536):
                     first_t = f.timestamp_us
                 last_t = f.timestamp_us
                 recorded_valid += int(f.attitude_valid)
+                if pending_boundary is not None and f.timestamp_us >= pending_boundary:
+                    native.lib.replay_recalibrate()
+                    manual_resets += 1
+                    pending_boundary = None
                 flags, values = native.update(f)
                 last_values = values
                 is_valid = bool(flags & 2048) and not flags & (1024 | 4096)
@@ -189,6 +205,7 @@ def replay(path, native, writer=None, chunk_size=65536):
         'input_timestamp_regressions': timing.timestamp_regressions,
         'valid_frames': valid, 'invalid_frames': frames-valid,
         'calibrating_frames': calibrating, 'reset_flag_frames': resets,
+        'manual_recalibrations_applied': manual_resets,
         'fusion_resets_including_initial': native.lib.replay_resets(),
         'first_valid_elapsed_s': first_valid, 'last_valid_elapsed_s': last_valid,
         'validity_transition_count': transition_count, 'validity_transitions': transitions,
@@ -232,5 +249,3 @@ def main(argv=None):
 
 if __name__ == '__main__':
     raise SystemExit(main())
-
-\n

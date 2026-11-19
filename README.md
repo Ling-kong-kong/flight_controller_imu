@@ -87,7 +87,7 @@ python3 tools/imu_capture.py --input capture.bin --stats
 python3 tools/imu_capture.py --input capture.bin --csv units.csv --units --stats
 ```
 
-`--units` 保留原始整数，额外添加 g 和 °/s 六列。主机工具兼容先前 IMU1、IMU2 v2 文件，新固件仅发送 IMU2 v3。
+`--units` 保留原始整数，额外添加 g 和 °/s 六列。主机工具兼容先前 IMU1、IMU2 v2 文件，新固件常规采样输出 IMU2 v3；显式手动重校准时另发送 32 字节控制 ACK，传感器 CSV 不增加控制行。
 
 新协议为 **IMU2 v3/type 3，76 字节、小端序**：
 
@@ -146,6 +146,10 @@ USB 关闭、卸载或挂起只清空发送队列、重建发送会话与序号�
 
 ### 校准与融合默认参数
 
+完整操作流程、校准原理、30 Hz 静置检测滤波用途及限制见 **[IMU 校准说明](docs/imu-calibration.md)**。
+
+上位机新增 **重新校准 IMU** 按钮，确认后无需重启即可重新估计零偏和重力倾角，并将相对 yaw 重新归零；原始采样、时间戳、序号和录制继续。执行确认 ACK 不等于校准完成，需等待重置边界之后的有效姿态；超时结果未知且不自动重试。操作步骤见 [手动重新校准](docs/imu-calibration.md#21-从上位机手动重新校准)，命令及 ACK 布局见 [协议文档](docs/protocol.md)。需配套更新固件和上位机，不能假定已烧录的旧固件支持。
+
 200 ms 窗口填满后，连续约 2 秒满足静置判据才估计陀螺零偏、用重力初始化倾角并将 yaw 归零（稳定上电通常约 **2.2 秒**）。移动、坏样本或不连续节拍会重新累计静置时间：
 
 - 当前角速度模长 <5 °/s，加速度模长距 1 g ≤0.1 g。
@@ -168,7 +172,7 @@ python3 -m unittest discover -s tests -v
 
 - `firmware/src/board.c`：时钟、电源、SPI、微秒时基、定时合帧调度、EXTI。
 - `firmware/src/bmi088.c`：初始化、配置回读和原始数据读取。
-- `firmware/src/stream.c`：历史选样、快照队列、主循环融合调度、质量标志、发送队列、USB 会话。
+- `firmware/src/stream.c`：历史选样、快照队列、主循环融合调度、质量标志、发送队列、手动重校准命令及 USB 会话。
 - `firmware/src/fusion.c`：静置校准、独立安装旋转、六轴 Mahony、四元数/Euler 与失效重置。
 - `firmware/src/protocol.c`：二进制帧及 CRC。
 - `tools/imu_capture.py`：主机采集、v2/v3 解码、CSV、输出和对齐统计。

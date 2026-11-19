@@ -37,6 +37,3 @@ class AttitudeHistory:
             now = time.monotonic() if now is None else now
             live = (connected and self.received_at is not None and now-self.received_at <= .1)
             return self.latest, bool(live), np.array(self.rows, dtype=float).reshape(-1, 4)
-
-
-\n

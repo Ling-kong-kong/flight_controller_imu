@@ -2,6 +2,7 @@
 #include "board.h"
 #include "protocol.h"
 #include "tusb.h"
+#include <string.h>
 
 _Static_assert((IMU_RING_CAPACITY & (IMU_RING_CAPACITY - 1u)) == 0u,
                "Ring capacity must be a power of two");
@@ -38,6 +39,32 @@ static volatile uint32_t fusion_head, fusion_tail;
 static volatile bool fusion_overflow;
 static uint32_t session;
 static fusion_t fusion;
+/* Main-context-only control state; ISR only advances fusion_head. */
+static uint8_t control_rx[IMU_CONTROL_SIZE], control_reply[IMU_CONTROL_SIZE];
+static unsigned control_used;
+static uint32_t control_id, control_boundary;
+static bool control_requested, control_reply_ready, control_cached;
+
+static void control_receive(uint8_t byte)
+{
+    control_rx[control_used++] = byte;
+    if (control_used < IMU_CONTROL_SIZE) return;
+    uint32_t id;
+    if (imu_decode_recalibrate(control_rx, &id)) {
+        if (control_cached && id == control_id) {
+            control_reply_ready = true; /* Retry ACK, never repeat the reset. */
+        } else if (!control_requested && !control_reply_ready) {
+            control_id = id;
+            control_boundary = fusion_head; /* Exclude the entire old backlog. */
+            control_requested = true;
+            control_cached = false;
+        }
+        control_used = 0;
+    } else {
+        memmove(control_rx, control_rx+1, IMU_CONTROL_SIZE-1u);
+        control_used = IMU_CONTROL_SIZE-1u;
+    }
+}
 
 bool stream_is_active(void)
 {
@@ -55,6 +82,8 @@ void stream_set_active(bool enabled)
     consumed = 0;
     sequence = 0;
     ++session;
+    control_used = 0;
+    control_requested = control_reply_ready = control_cached = false;
     pending_flags = enabled ? IMU_FLAG_SESSION : 0u;
     if (enabled) {
         ++g_imu_diagnostics.usb_sessions;
@@ -229,9 +258,16 @@ void stream_process_task(void)
             g_imu_diagnostics.fusion_resets = fusion.resets;
             return;
         }
+        const uint32_t sample_index = fusion_tail;
         sample = fusion_queue[fusion_tail % IMU_FUSION_QUEUE_CAPACITY];
         ++fusion_tail;
         __set_PRIMASK(saved);
+        if (control_requested && (int32_t)(sample_index-control_boundary) >= 0) {
+            fusion_reset(&fusion);
+            imu_encode_control_reply(control_reply, control_id, sample.time, sample.sequence);
+            control_requested = false;
+            control_cached = control_reply_ready = true;
+        }
         fusion_update(&fusion, sample.time, sample.accel, sample.gyro,
                       sample.age[0], sample.age[1], sample.flags);
         /* An ISR may have overflowed while floating-point work ran. The next
@@ -286,10 +322,11 @@ void stream_usb_task(void)
         (void)tud_cdc_write_clear();
         stream_set_active(connected);
     }
-    /* Incoming bytes have no commands; consume them to keep CDC RX healthy. */
-    uint8_t discard[64];
-    if (tud_cdc_available() != 0u) {
-        (void)tud_cdc_read(discard, sizeof(discard));
+    /* Bounded sliding command parser: at most 64 incoming bytes per pass. */
+    uint8_t incoming[64];
+    const uint32_t received = tud_cdc_read(incoming, sizeof(incoming));
+    if (active) {
+        for (uint32_t i=0; i<received; ++i) control_receive(incoming[i]);
     }
     if (!active) {
         return;
@@ -299,6 +336,12 @@ void stream_usb_task(void)
         return;
     }
     last_flush_us = now;
+    if (control_reply_ready) {
+        if (tud_cdc_write_available() < IMU_CONTROL_SIZE) return;
+        if (tud_cdc_write(control_reply, IMU_CONTROL_SIZE) != IMU_CONTROL_SIZE)
+            board_fatal(8u);
+        control_reply_ready = false;
+    }
     /* Up to 16 frames per pass lets a backlog catch up; normally one frame. */
     for (unsigned sent = 0; sent < 16u; ++sent) {
         const uint32_t tail = consumed;
