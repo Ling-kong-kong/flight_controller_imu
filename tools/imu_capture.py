@@ -20,6 +20,8 @@ MAGIC = b"IMU2"
 VERSION = 2
 FRAME_SIZE = 48
 FRAME_STRUCT = struct.Struct("<4sBBHIQhhhhhhIIHHI")
+FRAME_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
+ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 LEGACY_MAGIC = b"IMU1"
 LEGACY_FRAME_SIZE = 32
 LEGACY_FRAME_STRUCT = struct.Struct("<4sBBHIQhhhHI")
@@ -29,6 +31,7 @@ FLAG_NAMES = {
     1: "output_timing", 2: "accel_spi_error", 4: "gyro_spi_error", 8: "ring_overflow",
     16: "session_start", 32: "accel_stale", 64: "gyro_stale",
     128: "accel_drdy_interval", 256: "gyro_drdy_interval", 512: "history_missing",
+    1024: "calibrating", 2048: "attitude_valid", 4096: "fusion_reset",
 }
 
 
@@ -70,6 +73,25 @@ class PairedFrame:
     flags: int = 0
     tick_late_us: int = 0
 
+    protocol_version: int = 2
+    qw: float | None = None
+    qx: float | None = None
+    qy: float | None = None
+    qz: float | None = None
+    roll_deg: float | None = None
+    pitch_deg: float | None = None
+    yaw_deg: float | None = None
+
+    @property
+    def attitude_valid(self):
+        values = [getattr(self, k) for k in ATTITUDE_FIELDS]
+        return (self.protocol_version == 3 and bool(self.flags & 2048)
+                and not self.flags & (1024 | 4096)
+                and max(self.accel_age_us, self.gyro_age_us) <= self.timestamp_us
+                and self.gyro_age_us <= 1000 and not self.flags & 4
+                and all(v is not None and math.isfinite(v) for v in values)
+                and abs(sum(v*v for v in values[:4])-1) < 0.01)
+
     @property
     def accel_time_us(self) -> int:
         return self.timestamp_us - self.accel_age_us
@@ -80,12 +102,14 @@ class PairedFrame:
 
     def encode(self) -> bytes:
         """For offline fixtures only; the capture utility does not transmit."""
-        data = FRAME_STRUCT.pack(MAGIC, VERSION, 3, FRAME_SIZE,
-                                 self.sequence, self.timestamp_us,
-                                 self.ax, self.ay, self.az, self.gx, self.gy, self.gz,
-                                 self.accel_age_us, self.gyro_age_us,
-                                 self.flags, self.tick_late_us, 0)
-        return data[:44] + struct.pack("<I", zlib.crc32(data[:44]))
+        codec = FRAME_V3 if self.protocol_version == 3 else FRAME_STRUCT
+        values = [self.sequence, self.timestamp_us, self.ax, self.ay, self.az,
+                  self.gx, self.gy, self.gz, self.accel_age_us, self.gyro_age_us,
+                  self.flags, self.tick_late_us]
+        if self.protocol_version == 3:
+            values += [getattr(self, k) if getattr(self, k) is not None else 0.0 for k in ATTITUDE_FIELDS]
+        data = codec.pack(MAGIC, self.protocol_version, 3, codec.size, *values, 0)
+        return data[:-4] + struct.pack("<I", zlib.crc32(data[:-4]))
 
 
 class StreamParser:
@@ -104,8 +128,8 @@ class StreamParser:
     def feed(self, data: bytes) -> list[Frame | PairedFrame]:
         self.bytes_received += len(data)
         result: list[Frame | PairedFrame] = []
-        for start in range(0, len(data), self.BUFFER_LIMIT - FRAME_SIZE):
-            self.buffer.extend(data[start:start + self.BUFFER_LIMIT - FRAME_SIZE])
+        for start in range(0, len(data), self.BUFFER_LIMIT - FRAME_V3.size):
+            self.buffer.extend(data[start:start + self.BUFFER_LIMIT - FRAME_V3.size])
             self._drain(result)
         return result
 
@@ -126,10 +150,11 @@ class StreamParser:
             if len(self.buffer) < 8:
                 return
             paired = self.buffer[:4] == MAGIC
-            size = FRAME_SIZE if paired else LEGACY_FRAME_SIZE
-            expected_version = VERSION if paired else 1
+            version = self.buffer[4]
+            size = (FRAME_V3.size if version == 3 else FRAME_SIZE) if paired else LEGACY_FRAME_SIZE
+            valid_version = version in (2, 3) if paired else version == 1
             valid_type = self.buffer[5] == 3 if paired else self.buffer[5] in SENSOR_NAMES
-            if (self.buffer[4] != expected_version or not valid_type
+            if (not valid_version or not valid_type
                     or struct.unpack_from("<H", self.buffer, 6)[0] != size):
                 self.header_errors += 1
                 self._discard(1)
@@ -142,8 +167,9 @@ class StreamParser:
                 self._discard(1)
                 continue
             if paired:
-                fields = FRAME_STRUCT.unpack_from(self.buffer)
-                result.append(PairedFrame(*fields[4:16]))
+                fields = (FRAME_V3 if version == 3 else FRAME_STRUCT).unpack_from(self.buffer)
+                result.append(PairedFrame(*fields[4:16], protocol_version=version,
+                    **(dict(zip(ATTITUDE_FIELDS, fields[16:-1])) if version == 3 else {})))
             else:
                 fields = LEGACY_FRAME_STRUCT.unpack_from(self.buffer)
                 result.append(Frame(fields[2], fields[4], fields[5],
@@ -307,7 +333,7 @@ class Capture:
             columns = ["time_us", "sequence", "ax_raw", "ay_raw", "az_raw",
                        "gx_raw", "gy_raw", "gz_raw", "accel_age_us", "gyro_age_us",
                        "accel_time_us", "gyro_time_us", "flags", "tick_late_us",
-                       "protocol_version", "legacy_sensor"]
+                       "protocol_version", "legacy_sensor", "attitude_valid", *ATTITUDE_FIELDS]
             if units:
                 columns += ["ax_g", "ay_g", "az_g", "gx_deg_s", "gy_deg_s", "gz_deg_s"]
             self.csv_writer.writerow(columns)
@@ -322,7 +348,8 @@ class Capture:
                 row = [frame.timestamp_us, frame.sequence, *axes,
                        frame.accel_age_us, frame.gyro_age_us,
                        frame.accel_time_us, frame.gyro_time_us,
-                       frame.flags, frame.tick_late_us, 2, ""]
+                       frame.flags, frame.tick_late_us, frame.protocol_version, "", int(frame.attitude_valid),
+                       *[getattr(frame, k) if frame.attitude_valid else "" for k in ATTITUDE_FIELDS]]
             else:
                 self.sensors[frame.sensor_type].add(frame)
                 axes = ([frame.x, frame.y, frame.z, "", "", ""] if frame.sensor_type == 1
@@ -330,7 +357,7 @@ class Capture:
                 row = [frame.timestamp_us, frame.sequence, *axes,
                        "", "", frame.timestamp_us if frame.sensor_type == 1 else "",
                        frame.timestamp_us if frame.sensor_type == 2 else "",
-                       frame.flags, "", 1, frame.name]
+                       frame.flags, "", 1, frame.name, 0, *[""]*7]
             if self.csv_writer:
                 if self.units:
                     row += [value * ((24.0 if i < 3 else 2000.0) / 32768.0)

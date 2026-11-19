@@ -51,7 +51,14 @@ class SessionWriter:
             for name in ("cam0", "cam1"):
                 (self.path / name).mkdir()
             json_write(self.path / "session.json", dict(
-                schema_version=2, config=asdict(config), state="recording",
+                schema_version=3,
+                imu_protocol="IMU2 v3/type3/76 bytes (v2 offline supported)",
+                attitude_coordinates=dict(body="FRD", world="NED", quaternion="qw,qx,qy,qz body-to-world",
+                                          euler="3-2-1 roll,pitch,yaw degrees"),
+                attitude_heading="relative yaw zeroed at stationary calibration; drift allowed; no magnetometer",
+                attitude_installation="provisional ROTATION_PITCH_180; physical axes NOT yet verified",
+                attitude_invalid="attitude_valid=0; quaternion and Euler CSV columns blank",
+                config=asdict(config), state="recording",
                 timestamp_basis=TIME_BASIS, unified_timestamp_source="host_read_end_ns",
                 warning=HOST_WARNING, camera_clock_domain="unverified backend media clock",
                 camera_media_timestamp_semantics="not verified to be exposure time",

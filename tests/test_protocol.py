@@ -277,7 +277,7 @@ class PairedProtocolTests(unittest.TestCase):
         self.assertEqual(summary["source_skew_us"]["max"], 500)
         self.assertEqual(summary["tick_late_us"]["mean"], 100)
         self.assertAlmostEqual(summary["tick_late_us"]["std"], (20000 / 3) ** 0.5)
-        self.assertEqual(set(summary["flag_counts"].values()), {1})
+        self.assertEqual(set(summary["flag_counts"].values()), {0, 1})
 
     def test_paired_source_repeat_regression_and_invalid_age_visible(self):
         stats = imu.PairedStats()
@@ -314,6 +314,58 @@ class PairedProtocolTests(unittest.TestCase):
                                      "--stats"], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["imu"]["samples"], 1)
+
+
+class AttitudeProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.frame = imu.PairedFrame(7, 100000, 1, 2, 1365, 0, 0, 0, 100, 200,
+                                    flags=2048, protocol_version=3,
+                                    qw=1., qx=0., qy=0., qz=0.,
+                                    roll_deg=0., pitch_deg=0., yaw_deg=0.)
+
+    def test_v3_golden_vector(self):
+        f = replace(self.frame, sequence=0x12345678, timestamp_us=0x123456789abcdef0,
+                    ax=-32768, ay=32767, az=-1, gx=123, gy=-456, gz=789,
+                    accel_age_us=624, gyro_age_us=499, tick_late_us=321, yaw_deg=90.)
+        self.assertEqual(f.encode(), bytes.fromhex(
+            "494d553203034c0078563412f0debc9a785634120080ff7fffff7b0038fe1503"
+            "70020000f3010000000841010000803f000000000000000000000000"
+            "00000000000000000000b442187ba85c"))
+        self.assertEqual(len(f.encode()), 76)
+        self.assertEqual(imu.StreamParser().feed(f.encode()), [f])
+
+    def test_mixed_three_versions_splits_corruption_and_bounds(self):
+        old = replace(self.frame, protocol_version=2, qw=None, qx=None, qy=None,
+                      qz=None, roll_deg=None, pitch_deg=None, yaw_deg=None)
+        legacy = imu.Frame(1, 3, 4000, 1, 2, 3)
+        frames = [legacy, self.frame, old]
+        raw = b"".join(f.encode() for f in frames)
+        for cut in range(len(raw)+1):
+            p = imu.StreamParser()
+            self.assertEqual(p.feed(raw[:cut])+p.feed(raw[cut:]), frames)
+        p = imu.StreamParser()
+        self.assertEqual([f for b in raw for f in p.feed(bytes([b]))], frames)
+        bad = bytearray(self.frame.encode()); bad[48] ^= 1
+        p = imu.StreamParser()
+        self.assertEqual(p.feed(b"noise"+bad+self.frame.encode()[:19]+raw), frames)
+        self.assertGreaterEqual(p.crc_errors, 2)
+        p.feed(b"x"*100000+b"IMU")
+        self.assertLess(len(p.buffer), p.BUFFER_LIMIT)
+
+    def test_v3_csv_invalid_and_legacy_attitudes_blank(self):
+        output = io.StringIO()
+        frames = [self.frame, replace(self.frame, flags=1024),
+                  replace(self.frame, flags=2048|4096), replace(self.frame, gyro_age_us=1001),
+                  replace(self.frame, qw=float('nan')),
+                  replace(self.frame, protocol_version=2), imu.Frame(1, 3, 4000, 1, 2, 3)]
+        capture = imu.Capture(csv_file=output)
+        capture.feed(b"".join(f.encode() for f in frames))
+        rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+        self.assertEqual(rows[0]['attitude_valid'], '1')
+        self.assertEqual(float(rows[0]['qw']), 1.)
+        for row in rows[1:]:
+            self.assertIn(row['attitude_valid'], ('0', ''))
+            self.assertTrue(all(row[k] == '' for k in imu.ATTITUDE_FIELDS))
 
 
 if __name__ == "__main__":

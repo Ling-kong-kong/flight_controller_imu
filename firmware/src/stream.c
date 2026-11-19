@@ -26,6 +26,18 @@ static uint64_t previous_us[2];
 static bool have_previous[2];
 static uint16_t pending_flags;
 static uint64_t last_flush_us;
+typedef struct {
+    uint64_t time;
+    int16_t accel[3], gyro[3];
+    uint32_t age[2], sequence, session;
+    uint16_t flags, late;
+    bool send;
+} fusion_sample_t;
+static fusion_sample_t fusion_queue[IMU_FUSION_QUEUE_CAPACITY];
+static volatile uint32_t fusion_head, fusion_tail;
+static volatile bool fusion_overflow;
+static uint32_t session;
+static fusion_t fusion;
 
 bool stream_is_active(void)
 {
@@ -42,6 +54,7 @@ void stream_set_active(bool enabled)
     produced = 0;
     consumed = 0;
     sequence = 0;
+    ++session;
     pending_flags = enabled ? IMU_FLAG_SESSION : 0u;
     if (enabled) {
         ++g_imu_diagnostics.usb_sessions;
@@ -158,33 +171,110 @@ void stream_output_tick(uint64_t target_us, uint64_t actual_us, uint32_t skipped
     if (skew > g_imu_diagnostics.pair_skew_max_us) {
         g_imu_diagnostics.pair_skew_max_us = skew;
     }
-    uint8_t frame[IMU_FRAME_SIZE];
-    imu_encode_frame(frame, seq, target_us, selected[0].xyz, selected[1].xyz,
-                      age[0], age[1], flags,
-                      (late > UINT16_MAX) ? UINT16_MAX : (uint16_t)late);
-    /* Keep a genuine latest pair available via SWD even without an open USB. */
-    for (unsigned i = 0; i < IMU_FRAME_SIZE; ++i) {
-        g_last_imu_frame[i] = frame[i];
-    }
-    if (!active) {
+    const uint32_t head = fusion_head;
+    if (head-fusion_tail >= IMU_FUSION_QUEUE_CAPACITY) {
+        fusion_overflow = true;
+        ++g_imu_diagnostics.fusion_queue_drops;
+        restore_flags(flags | IMU_FLAG_OVERFLOW);
         return;
     }
-    const uint32_t head = produced;
-    const uint32_t used = head - consumed;
-    if (used >= IMU_RING_CAPACITY) {
-        restore_flags((flags & ~(IMU_FLAG_ACCEL_STALE | IMU_FLAG_GYRO_STALE)) |
-                       IMU_FLAG_OVERFLOW);
-        ++g_imu_diagnostics.ring_drops;
-        return;
+    fusion_sample_t *sample = &fusion_queue[head % IMU_FUSION_QUEUE_CAPACITY];
+    sample->time = target_us;
+    sample->sequence = seq;
+    sample->session = session;
+    sample->send = active;
+    sample->flags = flags;
+    sample->late = (late > UINT16_MAX) ? UINT16_MAX : (uint16_t)late;
+    for (unsigned i=0; i<3u; ++i) {
+        sample->accel[i] = selected[0].xyz[i];
+        sample->gyro[i] = selected[1].xyz[i];
     }
-    for (unsigned i = 0; i < IMU_FRAME_SIZE; ++i) {
-        ring[head & (IMU_RING_CAPACITY - 1u)][i] = frame[i];
-    }
+    sample->age[0] = age[0]; sample->age[1] = age[1];
     __DMB();
-    produced = head + 1u;
-    ++g_imu_diagnostics.queued_pairs;
-    if (used + 1u > g_imu_diagnostics.high_water_frames) {
-        g_imu_diagnostics.high_water_frames = used + 1u;
+    fusion_head = head+1u;
+    if (head+1u-fusion_tail > g_imu_diagnostics.fusion_high_water)
+        g_imu_diagnostics.fusion_high_water = head+1u-fusion_tail;
+}
+
+void stream_process_task(void)
+{
+    /* Only this main-context consumer performs floating point, CRC and encoding.
+     * Overflow discards the pre-loss backlog: never publish a valid attitude
+     * from before a known fusion discontinuity. USB congestion is independent. */
+    for (unsigned n=0; n<32u; ++n) {
+        fusion_sample_t sample;
+        const uint32_t saved = __get_PRIMASK();
+        __disable_irq();
+        if (fusion_overflow) {
+            g_imu_diagnostics.fusion_queue_drops += fusion_head-fusion_tail;
+            for (uint32_t i=fusion_tail; i!=fusion_head; ++i) {
+                const fusion_sample_t *queued = &fusion_queue[i % IMU_FUSION_QUEUE_CAPACITY];
+                if (active && queued->session == session)
+                    pending_flags |= queued->flags & IMU_FLAG_SESSION;
+            }
+            fusion_tail = fusion_head;
+            fusion_overflow = false;
+            __set_PRIMASK(saved);
+            fusion_reset(&fusion);
+            g_imu_diagnostics.fusion_resets = fusion.resets;
+            return;
+        }
+        if (fusion_tail == fusion_head) {
+            __set_PRIMASK(saved);
+            /* No samples at all is also a discontinuity. Reset once, not on
+             * every idle pass, and preserve the pending reset event. */
+            const uint64_t now = board_micros();
+            if (fusion.started && now > fusion.previous_tick &&
+                now-fusion.previous_tick > 10000u) fusion_reset(&fusion);
+            g_imu_diagnostics.fusion_resets = fusion.resets;
+            return;
+        }
+        sample = fusion_queue[fusion_tail % IMU_FUSION_QUEUE_CAPACITY];
+        ++fusion_tail;
+        __set_PRIMASK(saved);
+        fusion_update(&fusion, sample.time, sample.accel, sample.gyro,
+                      sample.age[0], sample.age[1], sample.flags);
+        /* An ISR may have overflowed while floating-point work ran. The next
+         * pass discards backlog and resets; do not publish this result. */
+        if (fusion_overflow) continue;
+        g_imu_diagnostics.fusion_resets = fusion.resets;
+        uint16_t flags = sample.flags;
+        if (fusion.attitude.calibrating) flags |= IMU_FLAG_CALIBRATING;
+        if (fusion.attitude.valid) flags |= IMU_FLAG_ATTITUDE_VALID;
+        if (fusion.attitude.reset) flags |= IMU_FLAG_FUSION_RESET;
+        uint8_t frame[IMU_FRAME_SIZE];
+        imu_encode_frame(frame, sample.sequence, sample.time, sample.accel, sample.gyro,
+                         sample.age[0], sample.age[1], flags, sample.late, &fusion.attitude);
+        /* Recheck and publish atomically with respect to the producer. Encoding
+         * and all floating point stay outside this short byte-copy section. */
+        const uint32_t publish_saved = __get_PRIMASK();
+        __disable_irq();
+        if (fusion_overflow) {
+            __set_PRIMASK(publish_saved);
+            continue;
+        }
+        for (unsigned i=0; i<IMU_FRAME_SIZE; ++i) g_last_imu_frame[i] = frame[i];
+        if (!sample.send || !active || sample.session != session) {
+            __set_PRIMASK(publish_saved);
+            continue;
+        }
+        const uint32_t head = produced;
+        const uint32_t used = head-consumed;
+        if (used >= IMU_RING_CAPACITY) {
+            restore_flags((flags & 0x03ffu & ~(IMU_FLAG_ACCEL_STALE | IMU_FLAG_GYRO_STALE)) |
+                          IMU_FLAG_OVERFLOW);
+            ++g_imu_diagnostics.ring_drops;
+            __set_PRIMASK(publish_saved);
+            continue;
+        }
+        for (unsigned i=0; i<IMU_FRAME_SIZE; ++i)
+            ring[head & (IMU_RING_CAPACITY-1u)][i] = frame[i];
+        __DMB();
+        produced = head+1u;
+        ++g_imu_diagnostics.queued_pairs;
+        if (used+1u > g_imu_diagnostics.high_water_frames)
+            g_imu_diagnostics.high_water_frames = used+1u;
+        __set_PRIMASK(publish_saved);
     }
 }
 

@@ -162,8 +162,8 @@ class WaveformHistory:
                 return
             if self.origin is None:
                 self.origin = int(times[0])
-            # Unknown quality bits are conservatively treated as invalid for plotting.
-            valid = ((flags & 0xFFEE) == 0) & ~invalid_source
+            # Attitude/calibration bits must not suppress raw six-axis measurements.
+            valid = ((flags & 0xE3EE) == 0) & ~invalid_source
             steps = (sequences.astype(np.uint64) - np.r_[
                 np.uint64(self.last_sequence if self.last_sequence is not None else (int(sequences[0])-1)&0xFFFFFFFF),
                 sequences[:-1].astype(np.uint64)]) & np.uint64(0xFFFFFFFF)

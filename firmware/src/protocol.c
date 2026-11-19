@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include <string.h>
 
 static void put16(uint8_t *out, uint16_t value)
 {
@@ -13,7 +14,7 @@ static void put32(uint8_t *out, uint32_t value)
     }
 }
 
-void imu_encode_frame(uint8_t frame[48], uint32_t sequence, uint64_t timestamp_us,
+void imu_encode_frame_v2(uint8_t frame[48], uint32_t sequence, uint64_t timestamp_us,
                       const int16_t accel[3], const int16_t gyro[3],
                       uint32_t accel_age_us, uint32_t gyro_age_us,
                       uint16_t flags, uint16_t tick_late_us)
@@ -46,4 +47,29 @@ void imu_encode_frame(uint8_t frame[48], uint32_t sequence, uint64_t timestamp_u
         }
     }
     put32(frame + 44, crc ^ UINT32_MAX);
+}
+
+void imu_encode_frame(uint8_t frame[76], uint32_t sequence, uint64_t timestamp_us,
+                      const int16_t accel[3], const int16_t gyro[3],
+                      uint32_t accel_age_us, uint32_t gyro_age_us,
+                      uint16_t flags, uint16_t tick_late_us, const attitude_t *a)
+{
+    imu_encode_frame_v2(frame, sequence, timestamp_us, accel, gyro,
+                        accel_age_us, gyro_age_us, flags, tick_late_us);
+    frame[4]=3u;
+    put16(frame+6,76u);
+    for (unsigned i=0;i<7u;++i) {
+        const float value = i<4u ? a->q[i] : a->euler[i-4u];
+        uint32_t bits;
+        _Static_assert(sizeof(float)==4u, "Protocol requires binary32 float");
+        memcpy(&bits,&value,sizeof(bits));
+        put32(frame+44u+4u*i,bits);
+    }
+    uint32_t crc=UINT32_MAX;
+    for (unsigned i=0;i<72u;++i) {
+        crc^=frame[i];
+        for (unsigned bit=0;bit<8u;++bit)
+            crc=(crc>>1)^((crc&1u)?0xEDB88320u:0u);
+    }
+    put32(frame+72,crc^UINT32_MAX);
 }

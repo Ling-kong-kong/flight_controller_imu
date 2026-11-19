@@ -9,6 +9,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .capture import Config, LiveConnection, BASE, discover_ports, camera_inventory
 from .timing import HOST_WARNING as WARNING
 from .waveform import WaveformPanel
+from .attitude import AttitudePanel, AttitudeDetailsDialog
 from .storage import export_euroc
 
 APP_STYLESHEET = """
@@ -199,7 +200,11 @@ class Window(QtWidgets.QMainWindow):
         self.preview_splitter.setChildrenCollapsible(False)
         self.preview_splitter.setHandleWidth(7)
         self.preview_splitter.addWidget(self.preview_label)
-        self.preview_splitter.addWidget(self.waveforms)
+        self.attitude_panel = AttitudePanel()
+        self.telemetry_tabs = QtWidgets.QTabWidget()
+        self.telemetry_tabs.addTab(self.waveforms, "原始六轴")
+        self.telemetry_tabs.addTab(self.attitude_panel, "姿态 / 四元数")
+        self.preview_splitter.addWidget(self.telemetry_tabs)
         layout.addWidget(self.preview_splitter, 1)
         self.status = QtWidgets.QLabel("待机 · 连接预览不写盘；开始录制后保存原始数据")
         self.status.setWordWrap(True)
@@ -221,6 +226,9 @@ class Window(QtWidgets.QMainWindow):
         detail_layout = QtWidgets.QVBoxLayout(detail_page)
         detail_layout.addWidget(self.telemetry)
         detail_layout.addWidget(self.diagnostics)
+        self.recorded_attitude_button = QtWidgets.QPushButton("查看已完成录制的姿态 / 四元数…")
+        self.recorded_attitude_button.clicked.connect(self.show_recorded_attitude)
+        detail_layout.addWidget(self.recorded_attitude_button)
         detail_layout.addStretch()
         detail_scroll = QtWidgets.QScrollArea()
         detail_scroll.setWidgetResizable(True)
@@ -366,6 +374,24 @@ class Window(QtWidgets.QMainWindow):
             self.set_recording_controls()
             self.log.appendPlainText("录制已停止，正在排空写盘并生成接收时间索引；设备保持连接、预览继续。")
 
+    def show_recorded_attitude(self):
+        source = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择已完成的原始会话", str(self.last_session or BASE/"recordings"))
+        if not source:
+            return
+        try:
+            path = Path(source)
+            session = json.loads((path/"session.json").read_text(encoding="utf8"))
+            if not session.get("finalized"):
+                raise ValueError("请先停止录制并等待写盘完成")
+            dialog = AttitudeDetailsDialog(path, self)
+            try:
+                dialog.exec()
+            finally:
+                dialog.handle.close()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "无法读取姿态详情", str(exc))
+
     def export_session(self):
         source = QtWidgets.QFileDialog.getExistingDirectory(
             self,"选择已完成的原始会话",str(self.last_session or BASE/"recordings"))
@@ -383,6 +409,7 @@ class Window(QtWidgets.QMainWindow):
     def tick(self):
         r = self.connection
         if r is None:
+            self.attitude_panel.refresh(connected=False)
             if self.closing and not self.recorder and not self.busy:
                 self.close()
             return
@@ -391,6 +418,7 @@ class Window(QtWidgets.QMainWindow):
         if diag:
             self.next_diag = now + 2
         s = r.snapshot()
+        self.attitude_panel.refresh(r.attitude_history, not r.stop_event.is_set())
         # Keep the old connection history if a new device attempt fails before
         # producing both streams. Once ready, this connection owns the history.
         if s["camera_frames"] and s["imu_frames"] and self.waveforms.history is not r.history:
@@ -446,6 +474,7 @@ class Window(QtWidgets.QMainWindow):
         if r.done.is_set():
             self.log.appendPlainText(("连接错误: "+r.error) if r.error else "设备已断开。")
             self.connection = None
+            self.attitude_panel.refresh(connected=False)
             self.preview_label.setText("设备已断开 · 点击「连接预览」重新显示")
             self.status.setText("连接错误: "+r.error if r.error else "已断开（未采集）")
         self.set_recording_controls()

@@ -4,7 +4,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/cmake/arm-none-eabi.cmake"
       CACHE FILEPATH "ARM bare-metal GCC toolchain")
 endif()
-project(bmi088_raw_imu VERSION 2.0.0 LANGUAGES C ASM)
+project(bmi088_raw_imu VERSION 3.0.0 LANGUAGES C ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

@@ -19,3 +19,10 @@ logs/*
 !logs/runtime-1000hz.log
 !logs/runtime-1000hz.json
 !logs/swd-1000hz-snapshot.bin
+
+# Local validation reports; keep implementation, tests and product docs tracked.
+docs/attitude-validation.md
+docs/attitude-hardware-*.md
+docs/imu-motion-validation-*.md
+docs/imu-noise-analysis-*.md
+docs/imu-stationary-filter-*.md

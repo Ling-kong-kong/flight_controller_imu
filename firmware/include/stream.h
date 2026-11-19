@@ -4,7 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define IMU_FRAME_SIZE 48u
+#define IMU_FRAME_SIZE 76u
+#define IMU_FUSION_QUEUE_CAPACITY 64u
 #define IMU_RING_CAPACITY 512u
 #define IMU_OUTPUT_PERIOD_US 1000u
 #define IMU_HISTORY_CAPACITY 8u
@@ -20,6 +21,10 @@
 #define IMU_FLAG_ACCEL_CADENCE 0x0080u
 #define IMU_FLAG_GYRO_CADENCE 0x0100u
 #define IMU_FLAG_HISTORY_MISSING 0x0200u
+
+#define IMU_FLAG_CALIBRATING 0x0400u
+#define IMU_FLAG_ATTITUDE_VALID 0x0800u
+#define IMU_FLAG_FUSION_RESET 0x1000u
 
 typedef struct {
     uint32_t drdy[2];
@@ -42,6 +47,9 @@ typedef struct {
     uint32_t last_target_high;
     uint32_t last_tick_late_us;
     uint32_t last_frame_sequence;
+    uint32_t fusion_queue_drops;
+    uint32_t fusion_high_water;
+    uint32_t fusion_resets;
 } imu_diagnostics_t;
 
 /* Counters are also available via SWD; no text/status is mixed into USB data. */
@@ -52,6 +60,7 @@ void stream_set_active(bool active);
 void stream_sample(uint8_t type, uint64_t timestamp_us,
                    const int16_t xyz[3], bool valid, bool read_was_slow);
 void stream_output_tick(uint64_t target_us, uint64_t actual_us, uint32_t skipped_ticks);
+void stream_process_task(void);
 void stream_usb_task(void);
 bool stream_is_active(void);
 

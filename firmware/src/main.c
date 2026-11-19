@@ -24,6 +24,7 @@ int main(void)
     for (;;) {
         tud_task();
         stream_usb_task();
+        stream_process_task();
         const uint64_t now = board_micros();
         if (now - health_check_us >= 100000u) {
             for (unsigned i = 0; i < 2u; ++i) {

@@ -490,12 +490,15 @@ class LiveConnection(Recorder):
         super().__init__(config)
         from .history import WaveformHistory
         self.history = WaveformHistory()
+        from .attitude_history import AttitudeHistory
+        self.attitude_history = AttitudeHistory()
         self.routing_lock = threading.RLock()
         self.recording = None
         self.identity = None
 
     def _waveform_frames(self, frames):
         self.history.append_frames(frames)
+        self.attitude_history.append_frames(frames)
 
     def start(self):
         self.identity = select_port(self.config.port, self.config.serial_number)

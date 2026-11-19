@@ -2,7 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
-from .protocol import Parser, Continuity
+from .protocol import Parser, Continuity, ATTITUDE_FIELDS
 from .storage import read_csv, json_write
 from .clock import ClockModel, align_camera
 from .timing import TIME_BASIS
@@ -48,7 +48,12 @@ def verify_session(path, decode_all=False, write_report=True):
                 row = next(imu, None)
                 if row is None or int(row["sample_id"]) != samples or int(row["batch_id"]) != batches:
                     raise ValueError("IMU row/batch correspondence mismatch")
-                if any(row[k] != str(v) for k,v in f.row().items()):
+                # Only old schemas may omit the newly introduced attitude fields.
+                new_fields = set(ATTITUDE_FIELDS) | {"protocol_version", "attitude_valid"}
+                expected = f.row()
+                if session.get("schema_version", 1) < 3 and f.protocol_version == 2:
+                    expected = {k:v for k,v in expected.items() if k in row or k not in new_fields}
+                if any(row.get(k) != str(v) for k,v in expected.items()):
                     raise ValueError("IMU CSV differs from raw USB decoding")
                 if (host_mode and "unified_timestamp_ns" not in row) or (
                         "unified_timestamp_ns" in row and row["unified_timestamp_ns"] != str(end)):

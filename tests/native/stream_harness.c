@@ -1,5 +1,7 @@
 #include "board.h"
 #include "stream.h"
+#include "fusion.h"
+#include "protocol.h"
 #include "tusb.h"
 
 #include <setjmp.h>
@@ -126,4 +128,34 @@ void mock_unmount_event(void)
 {
     connected = false;
     tud_umount_cb();
+}
+
+/* Main-loop work and fusion accessors: no ISR-side processing in the mock. */
+void mock_process_at(uint64_t timestamp) { now = timestamp; stream_process_task(); }
+uint32_t mock_fusion_drops(void) { return g_imu_diagnostics.fusion_queue_drops; }
+uint32_t mock_fusion_resets(void) { return g_imu_diagnostics.fusion_resets; }
+uint32_t mock_ring_drops(void) { return g_imu_diagnostics.ring_drops; }
+static fusion_t test_fusion;
+void mock_fusion_reset(void) { memset(&test_fusion, 0, sizeof(test_fusion)); fusion_reset(&test_fusion); }
+void mock_fusion_update(uint64_t t, const int16_t *a, const int16_t *g,
+                        uint32_t aa, uint32_t ga, uint16_t flags) {
+    fusion_update(&test_fusion, t, a, g, aa, ga, flags);
+}
+float mock_attitude(unsigned i) {
+    return i < 4u ? test_fusion.attitude.q[i] : test_fusion.attitude.euler[i-4u];
+}
+unsigned mock_attitude_flags(void) {
+    return (test_fusion.attitude.valid ? IMU_FLAG_ATTITUDE_VALID : 0u) |
+           (test_fusion.attitude.calibrating ? IMU_FLAG_CALIBRATING : 0u) |
+           (test_fusion.attitude.reset ? IMU_FLAG_FUSION_RESET : 0u);
+}
+unsigned mock_test_resets(void) { return test_fusion.resets; }
+/* Read-only diagnostics for detector numerical/reset contract tests. */
+float mock_stationary_gyro(unsigned i) { return test_fusion.stationary_gyro[i]; }
+unsigned mock_stationary_count(void) { return test_fusion.count; }
+float mock_bias(unsigned i) { return test_fusion.bias[i]; }
+void mock_encode_v3(uint8_t *out) {
+    const int16_t a[3] = {-32768,32767,-1}, g[3] = {123,-456,789};
+    const attitude_t q = {.q={1,0,0,0},.euler={0,0,90},.valid=true};
+    imu_encode_frame(out,0x12345678,0x123456789abcdef0ULL,a,g,624,499,0x0800,321,&q);
 }

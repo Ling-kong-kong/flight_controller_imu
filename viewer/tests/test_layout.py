@@ -7,6 +7,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 from PySide6 import QtCore, QtGui, QtWidgets
+from imu_viewer.attitude_history import AttitudeHistory
 from imu_viewer.gui import Window, StereoPreview, APP_STYLESHEET
 import numpy as np
 
@@ -102,7 +103,8 @@ class LayoutTests(unittest.TestCase):
             done.set()
             window.connection = SimpleNamespace(
                 snapshot=lambda **kw: snapshot, lock=threading.Lock(),
-                latest_image=None, done=done, error=snapshot['error'])
+                latest_image=None, done=done, attitude_history=AttitudeHistory(),
+                stop_event=done, error=snapshot['error'])
             window.next_diag = float('inf')
             window.show()
             window.tick()

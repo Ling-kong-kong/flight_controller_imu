@@ -1,14 +1,17 @@
-"""Independent, bounded IMU2 v2 decoder. No firmware imports or writes."""
+"""Independent, bounded IMU2 v2/v3 decoder. No firmware imports or writes."""
 from dataclasses import dataclass, asdict
 import math
 import struct
 import zlib
 
 PACKET = struct.Struct("<4sBBHIQhhhhhhIIHHI")
+PACKET_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
+ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 FLAGS = {1: "output_timing", 2: "accel_spi_error", 4: "gyro_spi_error",
          8: "ring_overflow", 16: "session_start", 32: "accel_stale",
          64: "gyro_stale", 128: "accel_drdy_anomaly",
-         256: "gyro_drdy_anomaly", 512: "history_missing"}
+         256: "gyro_drdy_anomaly", 512: "history_missing", 1024: "calibrating",
+         2048: "attitude_valid", 4096: "fusion_reset"}
 
 @dataclass(frozen=True)
 class Frame:
@@ -25,8 +28,30 @@ class Frame:
     flags: int = 0
     tick_late_us: int = 0
 
+    protocol_version: int = 2
+    qw: float | None = None
+    qx: float | None = None
+    qy: float | None = None
+    qz: float | None = None
+    roll_deg: float | None = None
+    pitch_deg: float | None = None
+    yaw_deg: float | None = None
+
+    @property
+    def attitude_valid(self):
+        values = [getattr(self, k) for k in ATTITUDE_FIELDS]
+        return (self.protocol_version == 3 and bool(self.flags & 2048)
+                and not self.flags & (1024 | 4096)
+                and max(self.accel_age_us, self.gyro_age_us) <= self.timestamp_us
+                and self.gyro_age_us <= 1000 and not self.flags & 4
+                and all(v is not None and math.isfinite(v) for v in values)
+                and abs(sum(v*v for v in values[:4])-1) < 0.01)
+
     def row(self):
         r = asdict(self)
+        r["attitude_valid"] = int(self.attitude_valid)
+        if not self.attitude_valid:
+            r.update({k: "" for k in ATTITUDE_FIELDS})
         r.update(timestamp_ns=self.timestamp_us * 1000,
                  accel_time_us=self.timestamp_us - self.accel_age_us,
                  gyro_time_us=self.timestamp_us - self.gyro_age_us)
@@ -41,8 +66,14 @@ class Frame:
 
     def encode(self):
         """Offline fixture helper only; never transmitted."""
-        b = PACKET.pack(b"IMU2", 2, 3, 48, *asdict(self).values(), 0)
-        return b[:44] + struct.pack("<I", zlib.crc32(b[:44]))
+        values = [getattr(self, k) for k in (
+            "sequence", "timestamp_us", "ax_raw", "ay_raw", "az_raw",
+            "gx_raw", "gy_raw", "gz_raw", "accel_age_us", "gyro_age_us", "flags", "tick_late_us")]
+        packet = PACKET_V3 if self.protocol_version == 3 else PACKET
+        if self.protocol_version == 3:
+            values += [getattr(self, k) if getattr(self, k) is not None else 0.0 for k in ATTITUDE_FIELDS]
+        b = packet.pack(b"IMU2", self.protocol_version, 3, packet.size, *values, 0)
+        return b[:-4] + struct.pack("<I", zlib.crc32(b[:-4]))
 
 class Parser:
     def __init__(self):
@@ -64,20 +95,22 @@ class Parser:
                 self._discard(i)
                 if len(self.buffer) < 8:
                     break
-                if self.buffer[4:8] != b"\x02\x03\x30\x00":
+                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00"):
                     self.stats["header_errors"] += 1
                     self._discard(1)
                     continue
-                if len(self.buffer) < 48:
+                codec = PACKET_V3 if self.buffer[4] == 3 else PACKET
+                if len(self.buffer) < codec.size:
                     break
-                packet = bytes(self.buffer[:48])
-                fields = PACKET.unpack(packet)
-                if zlib.crc32(packet[:44]) != fields[-1]:
+                packet = bytes(self.buffer[:codec.size])
+                fields = codec.unpack(packet)
+                if zlib.crc32(packet[:-4]) != fields[-1]:
                     self.stats["crc_errors"] += 1
                     self._discard(1)
                     continue
-                del self.buffer[:48]
-                result.append(Frame(*fields[4:-1]))
+                del self.buffer[:codec.size]
+                result.append(Frame(*fields[4:16], protocol_version=fields[1],
+                                    **(dict(zip(ATTITUDE_FIELDS, fields[16:-1])) if fields[1] == 3 else {})))
                 self.stats["frames"] += 1
         return result
 
