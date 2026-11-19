@@ -25,9 +25,12 @@ class WaveViewBox(pg.ViewBox):
         factor = 1.002 ** (-event.delta())
         if vertical:
             self.enableAutoRange(y=False)
-            self.scaleBy((1, factor), center=center)
+            self.scaleBy(y=factor, center=center)
         else:
-            self.scaleBy((factor, 1), center=center)
+            # Passing (factor, 1) still explicitly sets BOTH axes in
+            # pyqtgraph and disables Y auto-range, even though Y did not move.
+            # Affect only X so live amplitude fitting keeps working.
+            self.scaleBy(x=factor, center=center)
         event.accept()
 
     def mouseDragEvent(self, event, axis=None):
@@ -54,6 +57,7 @@ class Chart(QtWidgets.QWidget):
     def __init__(self, title, unit, columns):
         super().__init__()
         self.title, self.unit, self.columns = title, unit, columns
+        self.fixed_y = False
         self.samples = np.empty(0)  # Small rendered series only, never full history.
         self.view = WaveViewBox()
         self.plot = pg.PlotWidget(viewBox=self.view, background="#101c2c")
@@ -67,11 +71,24 @@ class Chart(QtWidgets.QWidget):
                                       connect="finite", skipFiniteCheck=False)
                        for axis, color in zip("XYZ", ("#ff737e", "#59dfba", "#6db6ff"))]
         self.view.setXRange(0, 10, padding=0)
+        self.view.setAutoVisible(y=True)
         self.view.enableAutoRange(y=True)
+        self.y_mode = QtWidgets.QLabel()
+        self.y_mode.setToolTip("自动：适配可见时间区间；手动：回到实时恢复自动；手动（固定）：“纵轴范围…”的显式固定值，回到实时仍保留，纵轴自动可解除。")
+        self.view.sigStateChanged.connect(self.update_y_mode)
+        self.update_y_mode()
         self.setMinimumSize(240, 160)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.y_mode)
         layout.addWidget(self.plot)
+
+    def update_y_mode(self, *_):
+        text = "纵轴自动" if self.view.autoRangeEnabled()[1] else "纵轴手动"
+        if self.fixed_y and not self.view.autoRangeEnabled()[1]:
+            text += "（固定）"
+        if self.y_mode.text() != text:
+            self.y_mode.setText(text)
 
     def set_series(self, series):
         for curve, column in zip(self.curves, self.columns):
@@ -119,6 +136,69 @@ class RenderWorker(QtCore.QObject):
         self.thread.join(timeout=2)
 
 
+class YRangeDialog(QtWidgets.QDialog):
+    """Display-only settings; modeless so acquisition/preview stay interactive."""
+
+    def __init__(self, deck):
+        super().__init__(deck)
+        self.deck = deck
+        self.setWindowTitle("波形纵轴范围")
+        self.fields = []
+        layout = QtWidgets.QVBoxLayout(self)
+        hint = QtWidgets.QLabel("纵轴为幅值，不是时间。固定范围可观察细微变化，但范围外波形会被裁切。\n只影响显示，不改变采集、历史压缩或录制数据。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        for chart in deck.charts:
+            group = QtWidgets.QGroupBox(f"{chart.title}（{chart.unit}）")
+            form = QtWidgets.QFormLayout(group)
+            fixed = QtWidgets.QCheckBox("固定纵轴（实时／历史均保留）")
+            low, high = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
+            for spin in (low, high):
+                spin.setDecimals(6)
+                spin.setRange(-1e9, 1e9)
+                spin.setSingleStep(.01 if chart.unit == "g" else .1)
+                spin.setSuffix(" " + chart.unit)
+                spin.setKeyboardTracking(False)
+            form.addRow(fixed)
+            form.addRow("下限", low)
+            form.addRow("上限", high)
+            fixed.toggled.connect(low.setEnabled)
+            fixed.toggled.connect(high.setEnabled)
+            self.fields.append((fixed, low, high))
+            layout.addWidget(group)
+        self.error = QtWidgets.QLabel()
+        self.error.setStyleSheet("color: #f06464")
+        self.error.setWordWrap(True)
+        layout.addWidget(self.error)
+        self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Apply |
+                                                  QtWidgets.QDialogButtonBox.Close)
+        self.buttons.button(QtWidgets.QDialogButtonBox.Apply).setText("应用")
+        self.buttons.button(QtWidgets.QDialogButtonBox.Close).setText("关闭")
+        self.buttons.button(QtWidgets.QDialogButtonBox.Apply).clicked.connect(self.apply)
+        self.buttons.rejected.connect(self.close)
+        layout.addWidget(self.buttons)
+
+    def load_ranges(self):
+        self.error.clear()
+        for chart, (fixed, low, high) in zip(self.deck.charts, self.fields):
+            bounds = chart.view.viewRange()[1]
+            low.setValue(bounds[0])
+            high.setValue(bounds[1])
+            fixed.setChecked(chart.fixed_y)
+            low.setEnabled(chart.fixed_y)
+            high.setEnabled(chart.fixed_y)
+
+    def apply(self):
+        ranges = [(low.value(), high.value()) if fixed.isChecked() else None
+                  for fixed, low, high in self.fields]
+        try:
+            self.deck.set_y_ranges(ranges)
+        except ValueError as exc:
+            self.error.setText(str(exc))
+            return
+        self.error.clear()
+
+
 class ExpandedChart(QtWidgets.QMainWindow):
     def __init__(self, deck, chart):
         super().__init__(deck.window())
@@ -130,9 +210,12 @@ class ExpandedChart(QtWidgets.QMainWindow):
                                ("左半屏", lambda: self.half(False)),
                                ("右半屏", lambda: self.half(True)),
                                ("回到实时", deck.live), ("查看全程", deck.all_history),
-                               ("纵轴自动", deck.auto_y), ("返回主窗口", self.close)):
+                               ("纵轴自动", deck.auto_y), ("纵轴范围…", deck.show_ranges),
+                               ("返回主窗口", self.close)):
             action = toolbar.addAction(text)
             action.triggered.connect(callback)
+        time_controls, self.time_span_spin = deck.make_time_controls()
+        toolbar.addWidget(time_controls)
         self.statusBar().showMessage("滚轮缩放时间 · 拖动回看 · Shift+滚轮缩放幅值 · 早期数据为分段峰值")
         self.setCentralWidget(chart)
         escape = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self)
@@ -152,15 +235,19 @@ class ExpandedChart(QtWidgets.QMainWindow):
 
 
 class WaveformPanel(QtWidgets.QWidget):
+    time_span_changed = QtCore.Signal(float)
+
     def __init__(self):
         super().__init__()
         self.history = None
         self.generation = self.version = 0
         self.follow = True
+        self.time_span = 10.0
         self.changing = False
         self.last_request = None
         self.last_submit = 0.0
         self.expanded = {}
+        self.range_dialog = None
         self.worker = RenderWorker()
         self.worker.result.connect(self.rendered)
         self.last_error = None
@@ -172,10 +259,12 @@ class WaveformPanel(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         controls = QtWidgets.QHBoxLayout()
         for text, callback in (("回到实时", self.live), ("查看全程", self.all_history),
-                               ("纵轴自动", self.auto_y)):
+                               ("纵轴自动", self.auto_y), ("纵轴范围…", self.show_ranges)):
             button = QtWidgets.QPushButton(text)
             button.clicked.connect(callback)
             controls.addWidget(button)
+        time_controls, self.time_span_spin = self.make_time_controls()
+        controls.addWidget(time_controls)
         controls.addStretch()
         help_label = QtWidgets.QLabel("滚轮缩放 · 拖动回看 · 双击放大")
         help_label.setWordWrap(True)
@@ -205,11 +294,59 @@ class WaveformPanel(QtWidgets.QWidget):
         self.timer.timeout.connect(self.refresh)
         self.timer.start(100)
 
+    def show_ranges(self):
+        if self.range_dialog is None:
+            self.range_dialog = YRangeDialog(self)
+        if not self.range_dialog.isVisible():
+            self.range_dialog.load_ranges()
+        self.range_dialog.show()
+        self.range_dialog.raise_()
+        self.range_dialog.activateWindow()
+
+    def make_time_controls(self):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QtWidgets.QLabel("时间窗"))
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setObjectName("timeSpan")
+        spin.setDecimals(3)
+        spin.setRange(.001, 86400)
+        spin.setSingleStep(.1)
+        spin.setSuffix(" s")
+        spin.setKeyboardTracking(False)
+        spin.setValue(self.time_span)
+        spin.setToolTip("横轴显示时长；实时跟随最新数据，历史查看以当前中心调整。不会改变采样或最近 10 秒完整历史策略。")
+        spin.valueChanged.connect(self.set_time_span)
+        self.time_span_changed.connect(spin.setValue)
+        layout.addWidget(spin)
+        return widget, spin
+
+    def set_time_span(self, seconds):
+        seconds = float(seconds)
+        if not np.isfinite(seconds) or not .001 <= seconds <= 86400:
+            raise ValueError("时间窗必须在 0.001–86400 秒之间")
+        if seconds == self.time_span:
+            return
+        self.time_span = seconds
+        self.time_span_changed.emit(seconds)
+        self.version += 1
+        self.last_request = None
+        if not self.follow:
+            lo, hi = self.accel_chart.view.viewRange()[0]
+            center = (lo+hi)/2
+            self.set_range(center-seconds/2, center+seconds/2)
+        elif self.history is None or self.history.info().origin_us is None:
+            self.set_range(0, seconds)
+        self.refresh()
+
     def set_stacked(self, stacked):
         self.chart_splitter.setOrientation(QtCore.Qt.Vertical if stacked else QtCore.Qt.Horizontal)
         self.chart_splitter.setSizes([500, 500])
 
     def set_history(self, history):
+        if self.range_dialog is not None:
+            self.range_dialog.close()
         self.history = history
         self.generation += 1
         self.version += 1
@@ -219,7 +356,8 @@ class WaveformPanel(QtWidgets.QWidget):
         empty = [(np.empty(0), np.empty(0)) for _ in range(6)]
         for chart in self.charts:
             chart.set_series(empty)
-        self.set_range(0, 10)
+        self.set_range(0, self.time_span)
+        self.auto_y()
         self.refresh()
 
     def manual(self):
@@ -250,6 +388,9 @@ class WaveformPanel(QtWidgets.QWidget):
             self.changing = False
 
     def live(self):
+        for chart in self.charts:
+            if not chart.fixed_y:
+                chart.view.enableAutoRange(y=True)
         self.follow = True
         self.version += 1
         self.last_request = None
@@ -261,9 +402,25 @@ class WaveformPanel(QtWidgets.QWidget):
             self.set_range(0, max(.01, self.history.info().duration))
         self.refresh()
 
+    def set_y_ranges(self, ranges):
+        # Validate everything before applying: a bad second range must not
+        # partially change the first chart. None requests visible-data auto Y.
+        if len(ranges) != len(self.charts):
+            raise ValueError("需要分别提供加速度和角速度范围")
+        for bounds in ranges:
+            if bounds is not None and (len(bounds) != 2 or
+                    not all(np.isfinite(v) for v in bounds) or bounds[0] >= bounds[1]):
+                raise ValueError("纵轴下限必须小于上限，且必须为有限数值")
+        for chart, bounds in zip(self.charts, ranges):
+            chart.fixed_y = bounds is not None
+            if bounds is None:
+                chart.view.enableAutoRange(y=True)
+            else:
+                chart.view.setYRange(*bounds, padding=0)
+            chart.update_y_mode()
+
     def auto_y(self):
-        for chart in self.charts:
-            chart.view.enableAutoRange(y=True)
+        self.set_y_ranges([None, None])
 
     def refresh(self):
         if self.history is None:
@@ -272,7 +429,7 @@ class WaveformPanel(QtWidgets.QWidget):
         if info.origin_us is None:
             return
         if self.follow:
-            self.set_range(max(0, info.duration-10), max(10, info.duration))
+            self.set_range(max(0, info.duration-self.time_span), max(self.time_span, info.duration))
         lo, hi = self.accel_chart.view.viewRange()[0]
         exact_start = (info.raw_start_us-info.origin_us)/1e6 if info.raw_start_us is not None else info.duration
         fidelity = "完整样本" if lo >= exact_start else "分段峰值（早期细节不可恢复）" + (" + 最近完整样本" if hi >= exact_start else "")
@@ -337,6 +494,8 @@ class WaveformPanel(QtWidgets.QWidget):
 
     def shutdown(self):
         self.timer.stop()
+        if self.range_dialog is not None:
+            self.range_dialog.close()
         for window in list(self.expanded.values()):
             window.close()
         self.worker.shutdown()
