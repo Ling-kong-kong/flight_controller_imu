@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import time
 import cv2
-from .protocol import Frame, Parser, ControlReply
+from .protocol import ATTITUDE_FIELDS, Frame, Parser, ControlReply
 from .clock import WARNING, fit_clock, align_camera
 from .timing import HOST_WARNING, TIME_BASIS, iter_host_imu, match_images, image_filename
 
@@ -310,6 +310,16 @@ def export_euroc(source, destination, match_tolerance_ns=20_000_000):
     folder = destination / "mav0" / "imu0"
     folder.mkdir()
     image_fields = ["image_frame_id", "image_timestamp_ns", "image_minus_imu_ns", "cam0", "cam1"]
+    # Reorder only the combined export; source/provenance CSVs remain byte-identical.
+    # Read the header even for an empty session, including legacy schemas.
+    with (source / "imu.csv").open(newline="", encoding="utf-8") as source_imu:
+        fields = next(csv.reader(source_imu), []) or IMU_FIELDS
+    if "unified_timestamp_ns" not in fields:
+        fields = fields + ["unified_timestamp_ns"]
+    raw_fields = [k for k in ("ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw") if k in fields]
+    attitude_fields = [k for k in (*ATTITUDE_FIELDS, "attitude_valid") if k in fields]
+    supplemental_fields = [k for k in fields if k not in raw_fields and k not in attitude_fields]
+    joined_fields = raw_fields + image_fields + attitude_fields + supplemental_fields
     imu_count = duplicate_count = 0
     previous = None
     with (folder / "data.csv").open("w", newline="", encoding="utf-8") as f, \
@@ -317,13 +327,7 @@ def export_euroc(source, destination, match_tolerance_ns=20_000_000):
         writer = csv.writer(f)
         writer.writerow(["#timestamp [ns]", "w_RS_S_x [rad s^-1]", "w_RS_S_y [rad s^-1]",
                          "w_RS_S_z [rad s^-1]", "a_RS_S_x [m s^-2]", "a_RS_S_y [m s^-2]", "a_RS_S_z [m s^-2]"])
-        # Raw sensor columns stay unchanged, alongside the explicit unified host time.
-        fields = list(next(iter(read_csv(source / "imu.csv")), {}).keys())
-        if not fields:
-            fields = IMU_FIELDS
-        if "unified_timestamp_ns" not in fields:
-            fields = fields + ["unified_timestamp_ns"]
-        out = csv.DictWriter(joined, fields + image_fields)
+        out = csv.DictWriter(joined, joined_fields)
         out.writeheader()
         for row in iter_host_imu(source):
             stamp = int(row["unified_timestamp_ns"])
@@ -349,6 +353,9 @@ def export_euroc(source, destination, match_tolerance_ns=20_000_000):
             shutil.copy2(source / name, trace / name)
     json_write(destination / "export.json", dict(
         warning=HOST_WARNING, timestamp_basis=TIME_BASIS, timestamp_source="host_read_end_ns",
+        imu_image_columns=joined_fields,
+        imu_image_column_groups=dict(raw_six_axis=raw_fields, image=image_fields,
+                                     attitude=attitude_fields, supplemental=supplemental_fields),
         source=str(source.resolve()), imu_frames=imu_count, stereo_pairs=len(frames),
         matched_images=len(associations), unmatched_imu_rows=imu_count-len(associations),
         unmatched_images=len(frames)-len(associations), match_tolerance_ns=match_tolerance_ns,
@@ -363,6 +370,9 @@ def export_euroc(source, destination, match_tolerance_ns=20_000_000):
         "IMU rows in a USB batch share a timestamp; duplicates are not altered.\n"
         "EuRoC-shaped only: consumers requiring strictly increasing times may reject this data.\n"
         "imu_image.csv includes EVERY IMU row; unmatched image fields are blank.\n"
+        "Column order: raw six-axis -> image information -> quaternion/Euler and attitude_valid -> supplemental IMU fields.\n"
+        "Valid attitude is retained even without an image; invalid attitude values remain blank.\n"
+        "Source/provenance imu.csv and the seven-column EuRoC IMU table keep their original layouts.\n"
         "Association is a time-ordered nearest-remaining one-to-one match within the documented tolerance, not synchronization.\n"
         "No calibration supplied; axes unchanged; rad/s and m/s^2. Archive source with provenance.\n", encoding="utf-8")
     marker.unlink()

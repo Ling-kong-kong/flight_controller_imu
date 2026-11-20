@@ -209,7 +209,16 @@ session.json 的 stopped / stopped_error 是最终状态；quality 中 done 是�
 
 ### `imu_image.csv`：每条 IMU 都保留
 
-此表以 IMU 为主表，**每条 CRC 有效合并帧输出一行，绝不只导出匹配成功的行**。原 IMU 字段（包括 H743 时间、原始六轴整数、质量标志、名义换算及新增姿态列）保持原样，另列 `unified_timestamp_ns`。追加图像字段：
+此表以 IMU 为主表，**每条 CRC 有效合并帧输出一行，绝不只导出匹配成功的行**。列按 **原始六轴 → 图片信息 → 四元数／欧拉角 → 补充 IMU 信息** 排列：
+
+1. 原始六轴：`ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw`。
+2. 图片信息：`image_frame_id, image_timestamp_ns, image_minus_imu_ns, cam0, cam1`。
+3. 姿态：`qw, qx, qy, qz, roll_deg, pitch_deg, yaw_deg, attitude_valid`。
+4. 补充信息：其余所有源 IMU 字段（样本／批次编号、统一电脑接收时间、H743 原始时间、序号、协议版本、样本年龄、质量标志及物理量换算等），按其源表中的相对顺序保留。
+
+**只调整合并导出表的列顺序，不修改任何原始 IMU 字段值，也不更改采集格式、时间匹配算法或 EuRoC 七列格式。** `provenance/imu.csv` 仍为源文件的原样副本。旧会话源表缺少姿态列时不补算或伪造姿态。即使没有 IMU 行，也根据源表头生成导出表头。`export.json` 的 `imu_image_columns` 和 `imu_image_column_groups` 记录实际列顺序与分组。此顺序应用于重新执行的导出，不重写已有导出目录。
+
+图片字段的内容与留空规则：
 
 | 字段 | 匹配成功时 | 无对应图像时 |
 | --- | --- | --- |
@@ -218,7 +227,7 @@ session.json 的 stopped / stopped_error 是最终状态；quality 中 done 是�
 | image_minus_imu_ns | 图像减 IMU 接收时间的有符号纳秒差 | 空 |
 | cam0 / cam1 | 导出灰度图相对路径 | 空 |
 
-只将**图像字段留空**，不清空该行 IMU 值、不填 0、不丢弃未匹配 IMU，也不把同一幅图重复填到所有高频 IMU 行中。
+未匹配图片时，只将**图像字段留空**，不清空该行六轴或有效姿态、不填 0、不丢弃未匹配 IMU，也不把同一幅图重复填到所有高频 IMU 行中。四元数／欧拉角来自同条 H743 数据帧，与图片是否匹配无关；姿态本身无效时，其七个数值字段为空且 `attitude_valid=0`。
 
 匹配规则：按相机帧顺序，在容差内选择接收时间最近的**尚未匹配 IMU**，一对一匹配；等距选择较早 IMU（同批同时间选较早 sample_id）。这是顺序贪心规则，不是全局最优分配，也不是硬件触发或曝光同步。所有未匹配图像仍保留在相机目录与索引中；`export.json` 报告匹配数、未匹配 IMU 数及未匹配图像数。
 

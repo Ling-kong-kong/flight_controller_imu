@@ -223,6 +223,49 @@ class AttitudeStorageTests(unittest.TestCase):
         self.assertEqual(extended[0]["qw"], "")
         self.assertEqual(extended[2]["qw"], "1.0")
 
+    def test_export_raw_image_attitude_column_order_and_sparse_values(self):
+        path = self.session()
+        source_bytes = {name: (path/name).read_bytes()
+                        for name in ("imu.csv", "frames.csv", "usb.bin")}
+        target = self.root/"ordered_export"
+        export_euroc(path, target)
+        rows = list(read_csv(target/"imu_image.csv"))
+        raw_fields = ["ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw"]
+        image_fields = ["image_frame_id", "image_timestamp_ns", "image_minus_imu_ns", "cam0", "cam1"]
+        leading = raw_fields + image_fields + list(ATTITUDE_FIELDS) + ["attitude_valid"]
+        fields = list(rows[0])
+        self.assertEqual(fields[:len(leading)], leading)
+        original = list(read_csv(path/"imu.csv"))
+        self.assertEqual(len(rows), len(original))
+        self.assertEqual(set(fields), set(original[0]) | set(image_fields))
+        self.assertEqual(len(fields), len(set(fields)))
+        report = json.loads((target/"export.json").read_text(encoding="utf8"))
+        self.assertEqual(report["imu_image_columns"], fields)
+        groups = report["imu_image_column_groups"]
+        self.assertEqual(groups["raw_six_axis"], raw_fields)
+        self.assertEqual(groups["image"], image_fields)
+        self.assertEqual(groups["attitude"], list(ATTITUDE_FIELDS)+["attitude_valid"])
+        self.assertEqual(sum(groups.values(), []), fields)
+        for i, (row, source) in enumerate(zip(rows, original)):
+            self.assertEqual({k: row[k] for k in source}, source)
+            if i == 2:
+                self.assertEqual(row["image_frame_id"], "0")
+                self.assertTrue((target/row["cam0"]).exists())
+                self.assertTrue((target/row["cam1"]).exists())
+            else:
+                self.assertEqual([row[k] for k in image_fields], [""]*5)
+            if i >= 2:
+                # Valid attitude survives even with no corresponding image.
+                self.assertEqual(row["attitude_valid"], "1")
+                self.assertEqual(row["qw"], "1.0")
+            else:
+                self.assertEqual([row[k] for k in ATTITUDE_FIELDS], [""]*7)
+        for name, data in source_bytes.items():
+            self.assertEqual((path/name).read_bytes(), data)
+            if name == "imu.csv":
+                self.assertEqual((target/"provenance"/name).read_bytes(), data)
+        self.assertEqual(len(list(read_csv(target/"mav0/imu0/data.csv"))[0]), 7)
+
     def test_modified_attitude_csv_rejected(self):
         path = self.session()
         text = (path/"imu.csv").read_text(encoding="utf8")
@@ -256,3 +299,12 @@ class AttitudeStorageTests(unittest.TestCase):
         metadata["schema_version"] = 2
         (path/"session.json").write_text(json.dumps(metadata), encoding="utf8")
         self.assertEqual(verify_session(path)["imu_frames"], 1)
+        target = self.root/"legacy_export"
+        export_euroc(path, target)
+        exported = list(read_csv(target/"imu_image.csv"))
+        self.assertEqual(len(exported), 1)
+        self.assertFalse(set(ATTITUDE_FIELDS) & set(exported[0]))
+        self.assertEqual({k: exported[0][k] for k in fields},
+                         {k: rows[0][k] for k in fields})
+        self.assertEqual(list(exported[0])[:6],
+                         ["ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw"])

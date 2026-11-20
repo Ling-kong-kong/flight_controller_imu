@@ -130,6 +130,13 @@ class HostTimeTests(unittest.TestCase):
         output = self.root/'no_imu'
         self.assertEqual(export_euroc(source,output)['stereo_pairs'],5)
         self.assertEqual(audit(source,output)['imu_rows_all_checked'],0)
+        with (output/'imu_image.csv').open(newline='', encoding='utf8') as handle:
+            header = next(csv.reader(handle))
+        self.assertEqual(header[:11], ['ax_raw', 'ay_raw', 'az_raw', 'gx_raw', 'gy_raw', 'gz_raw',
+                                      'image_frame_id', 'image_timestamp_ns', 'image_minus_imu_ns', 'cam0', 'cam1'])
+        self.assertEqual(header[11:19], ['qw', 'qx', 'qy', 'qz', 'roll_deg', 'pitch_deg', 'yaw_deg', 'attitude_valid'])
+        report = json.loads((output/'export.json').read_text(encoding='utf8'))
+        self.assertEqual(report['imu_image_columns'], header)
 
     def test_tampered_unified_and_device_timestamp_rejected(self):
         source = self.small_session()
