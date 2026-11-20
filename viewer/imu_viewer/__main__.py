@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from .capture import Config, Recorder, BASE, discover_ports, camera_inventory, select_port
 from .storage import finalize, export_euroc
+from .workflow import validate_output_root, resolve_raw_session, export_recording
 
 def main():
     parser = argparse.ArgumentParser(description="H743 stereo viewer — read-only CDC; host receive timestamps; exposure timing unverified")
@@ -14,7 +15,7 @@ def main():
     gui = sub.add_parser("gui", help="Open the desktop viewer")
     gui.add_argument("--smoke-seconds", type=float, default=0)
     sub.add_parser("devices", help="List USB serial identities and Windows camera inventory")
-    record = sub.add_parser("record", help="Headless joint acquisition")
+    record = sub.add_parser("record", help="Headless joint acquisition followed by automatic export")
     record.add_argument("--port")
     record.add_argument("--serial-number")
     record.add_argument("--camera", type=int, default=0)
@@ -46,21 +47,22 @@ def main():
                              ensure_ascii=False, indent=2))
         elif args.command == "verify":
             from .verify import verify_session
-            print(json.dumps(verify_session(args.session, args.decode_all), ensure_ascii=False, indent=2))
+            print(json.dumps(verify_session(resolve_raw_session(args.session), args.decode_all), ensure_ascii=False, indent=2))
         elif args.command == "finalize":
-            print(json.dumps(finalize(args.session), ensure_ascii=False, indent=2))
+            print(json.dumps(finalize(resolve_raw_session(args.session)), ensure_ascii=False, indent=2))
         elif args.command == "export":
             if not math.isfinite(args.match_tolerance_ms * 1_000_000) or args.match_tolerance_ms < 0:
                 raise ValueError("--match-tolerance-ms must be finite and non-negative")
-            print(json.dumps(export_euroc(args.session, args.destination,
+            print(json.dumps(export_euroc(resolve_raw_session(args.session), args.destination,
                              round(args.match_tolerance_ms * 1_000_000)), ensure_ascii=False, indent=2))
         elif args.command == "record":
             if args.seconds <= 0:
                 raise ValueError("--seconds must be positive")
+            output_root = validate_output_root(args.output)
             identity = select_port(args.port, args.serial_number)
             recorder = Recorder(Config(port=identity["port"], serial_number=identity["serial_number"],
                 camera_index=args.camera, backend=args.backend, width=args.width,
-                height=args.height, fps=args.fps, output=args.output,
+                height=args.height, fps=args.fps, output=str(output_root),
                 min_free_bytes=int(args.disk_reserve_gib * 1024**3),
                 camera_inventory=camera_inventory()))
             path = recorder.start()
@@ -79,8 +81,10 @@ def main():
                 if not recorder.wait(100):
                     print("Recorder shutdown timed out; session may be incomplete", file=sys.stderr)
                     return 2
+            print("Raw recording finalized; exporting...", flush=True)
+            result = export_recording(path)
             print(json.dumps(dict(path=str(path), quality=recorder.snapshot(),
-                                  alignment=recorder.report), ensure_ascii=False, indent=2), flush=True)
+                                  alignment=recorder.report, export=result), ensure_ascii=False, indent=2), flush=True)
             return 2 if recorder.error else 0
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)

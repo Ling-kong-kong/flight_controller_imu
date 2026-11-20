@@ -169,7 +169,9 @@ class Recorder:
         if shutil.disk_usage(output).free < self.config.min_free_bytes:
             raise OSError("Insufficient free disk space before recording")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.path = output / f"session_{stamp}"
+        container = output / f"session_{stamp}"
+        container.mkdir(exist_ok=False)  # Reserve the whole session; never mix recordings.
+        self.path = container / "raw"
         self.writer = SessionWriter(self.path, self.config)
         try:
             json_write(self.path / "devices.json", dict(usb=identity,

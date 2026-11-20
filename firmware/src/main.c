@@ -1,6 +1,8 @@
 #include "board.h"
 #include "bmi088.h"
 #include "stream.h"
+#include "mag.h"
+#include "board_i2c.h"
 #include "tusb.h"
 
 int main(void)
@@ -17,6 +19,7 @@ int main(void)
     board_sampling_irq_enable();
     board_delay_us(3000u); /* Fill both raw histories before starting 1 kHz. */
     board_output_timer_enable();
+    board_i2c_init();
 
     uint64_t health_check_us = board_micros();
     uint32_t previous_drdy[2] = {0, 0};
@@ -25,6 +28,7 @@ int main(void)
         tud_task();
         stream_usb_task();
         stream_process_task();
+        mag_task();
         const uint64_t now = board_micros();
         if (now - health_check_us >= 100000u) {
             for (unsigned i = 0; i < 2u; ++i) {

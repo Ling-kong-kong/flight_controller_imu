@@ -141,6 +141,47 @@ class FirmwareNativeTests(unittest.TestCase):
         self.assertTrue(all(isinstance(frame, imu.PairedFrame) for frame in frames))
         return frames
 
+    def publish_mag(self, sequence):
+        frame = imu.MagFrame(sequence, sequence * 40000, 123, -456, 500, 12000,
+                             12.5, -32.0, 35.0, 15, 16, 50, 6, 0, 4, 7,
+                             0, 0, 3, 0, 1100)
+        self.lib.stream_publish_mag.argtypes = [ctypes.POINTER(ctypes.c_uint8)]
+        self.lib.stream_publish_mag.restype = ctypes.c_bool
+        overwritten = self.lib.stream_publish_mag((ctypes.c_uint8 * 72).from_buffer_copy(frame.encode()))
+        return frame, overwritten
+
+    def test_mag_single_slot_backpressure_and_imu_priority(self):
+        self.activate()
+        first, overwritten = self.publish_mag(1)
+        self.assertFalse(overwritten)
+        self.usb_pump(available=71)
+        self.assertEqual(self.wire(), b"")
+        latest, overwritten = self.publish_mag(2)
+        self.assertTrue(overwritten)
+        self.emit(101000)
+        self.usb_pump(available=76)
+        self.assertEqual(len(self.wire()), 76)  # IMU first, no room for magnetic frame.
+        self.assertIsInstance(imu.StreamParser().feed(self.wire())[0], imu.PairedFrame)
+        self.usb_pump(available=72)
+        self.assertEqual(self.wire()[76:], latest.encode())
+        self.usb_pump()
+        self.assertEqual(len(self.wire()), 148)  # Slot consumed, never repeated.
+
+    def test_mag_session_discards_pending_and_disconnected_samples(self):
+        self.assertFalse(self.publish_mag(1)[1])
+        self.activate()
+        self.usb_pump()
+        self.assertEqual(self.wire(), b"")
+        self.publish_mag(2)
+        self.lib.mock_line_state(False)
+        self.lib.mock_line_state(True)
+        self.usb_pump()
+        self.assertEqual(self.wire(), b"")
+        current, overwritten = self.publish_mag(3)
+        self.assertFalse(overwritten)
+        self.usb_pump()
+        self.assertEqual(self.wire(), current.encode())
+
     def test_c_encoder_matches_paired_golden_vector_and_python(self):
         expected = bytes.fromhex(
             "494d55320203300078563412f0debc9a785634120080ff7fffff"

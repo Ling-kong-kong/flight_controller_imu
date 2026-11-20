@@ -20,6 +20,8 @@ MAGIC = b"IMU2"
 VERSION = 2
 FRAME_SIZE = 48
 FRAME_STRUCT = struct.Struct("<4sBBHIQhhhhhhIIHHI")
+MAG_PACKET = struct.Struct("<4sBBHIQhhhHfffHBBBBBBIIIIII")
+assert MAG_PACKET.size == 72
 CONTROL = struct.Struct("<4sBBHIIQII")
 FRAME_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
 ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
@@ -126,6 +128,45 @@ class ControlReply:
         return data[:-4] + struct.pack("<I", zlib.crc32(data[:-4]))
 
 
+@dataclass(frozen=True)
+class MagFrame:
+    sequence: int
+    timestamp_us: int
+    x_raw: int
+    y_raw: int
+    z_raw: int
+    rhall: int
+    x_ut: float
+    y_ut: float
+    z_ut: float
+    flags: int
+    address: int
+    chip_id: int
+    state: int
+    error: int
+    rep_xy: int
+    rep_z: int
+    bus_errors: int
+    invalid_samples: int
+    not_ready: int
+    tx_overwrites: int
+    read_us: int
+
+    @property
+    def valid(self):
+        return (self.flags & 31 == 15 and self.address == 0x10 and self.chip_id == 0x32
+                and self.state == 6 and self.error == 0 and self.rep_xy == 4 and self.rep_z == 7
+                and 0 < self.rhall <= 16383
+                and -4096 < self.x_raw <= 4095 and -4096 < self.y_raw <= 4095
+                and -16384 < self.z_raw <= 16383
+                and all(math.isfinite(v) for v in (self.x_ut, self.y_ut, self.z_ut)))
+
+    def encode(self):
+        values = [getattr(self, key) for key in self.__dataclass_fields__]
+        data = MAG_PACKET.pack(MAGIC, 1, 4, MAG_PACKET.size, *values, 0)
+        return data[:-4] + struct.pack("<I", zlib.crc32(data[:-4]))
+
+
 class StreamParser:
     """Incremental decoder. Internal storage is bounded even for a huge feed()."""
 
@@ -139,6 +180,7 @@ class StreamParser:
         self.header_errors = 0
         self.frames = 0
         self.control_replies = 0
+        self.mag_frames = 0
         self.records = []
 
     def feed(self, data: bytes) -> list[Frame | PairedFrame]:
@@ -168,10 +210,13 @@ class StreamParser:
                 return
             paired = self.buffer[:4] == MAGIC
             version = self.buffer[4]
+            mag = paired and version == 1 and self.buffer[5] == 4
             control = paired and version == 1 and self.buffer[5] == 0x11
             size = (FRAME_V3.size if version == 3 else FRAME_SIZE) if paired else LEGACY_FRAME_SIZE
             valid_version = version in (2, 3) if paired else version == 1
             valid_type = self.buffer[5] == 3 if paired else self.buffer[5] in SENSOR_NAMES
+            if mag:
+                size, valid_version, valid_type = MAG_PACKET.size, True, True
             if control:
                 size, valid_version, valid_type = CONTROL.size, True, True
             if (not valid_version or not valid_type
@@ -185,6 +230,12 @@ class StreamParser:
             if zlib.crc32(self.buffer[:size - 4]) != wanted_crc:
                 self.crc_errors += 1
                 self._discard(1)
+                continue
+            if mag:
+                fields = MAG_PACKET.unpack_from(self.buffer)
+                self.records.append(MagFrame(*fields[4:-1]))
+                self.mag_frames += 1
+                del self.buffer[:size]
                 continue
             if control:
                 fields = CONTROL.unpack_from(self.buffer)
@@ -206,7 +257,7 @@ class StreamParser:
 
     def summary(self) -> dict:
         return {"bytes_received": self.bytes_received, "valid_frames": self.frames,
-                "control_replies": self.control_replies, "bytes_discarded": self.bytes_discarded,
+                "control_replies": self.control_replies, "mag_frames": self.mag_frames, "bytes_discarded": self.bytes_discarded,
                 "crc_errors": self.crc_errors, "header_errors": self.header_errors,
                 "trailing_bytes": len(self.buffer)}
 

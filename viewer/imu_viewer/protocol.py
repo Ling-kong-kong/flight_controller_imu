@@ -6,6 +6,7 @@ import zlib
 
 PACKET = struct.Struct("<4sBBHIQhhhhhhIIHHI")
 PACKET_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
+MAG_PACKET = struct.Struct("<4sBBHIQhhhHfffHBBBBBBIIIIII")
 CONTROL = struct.Struct("<4sBBHIIQII")
 ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 FLAGS = {1: "output_timing", 2: "accel_spi_error", 4: "gyro_spi_error",
@@ -104,7 +105,7 @@ class Parser:
         self.buffer = bytearray()
         self.records = []
         self.stats = dict(bytes_received=0, bytes_discarded=0,
-                          crc_errors=0, header_errors=0, frames=0, control_replies=0)
+                          crc_errors=0, header_errors=0, frames=0, control_replies=0, mag_frames=0)
 
     def feed(self, data):
         self.stats["bytes_received"] += len(data)
@@ -121,11 +122,13 @@ class Parser:
                 self._discard(i)
                 if len(self.buffer) < 8:
                     break
-                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00", b"\x01\x11\x20\x00"):
+                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00", b"\x01\x11\x20\x00", b"\x01\x04\x48\x00"):
                     self.stats["header_errors"] += 1
                     self._discard(1)
                     continue
                 codec = CONTROL if self.buffer[4] == 1 else (PACKET_V3 if self.buffer[4] == 3 else PACKET)
+                if self.buffer[5] == 4:
+                    codec = MAG_PACKET
                 if len(self.buffer) < codec.size:
                     break
                 packet = bytes(self.buffer[:codec.size])
@@ -135,6 +138,10 @@ class Parser:
                     self._discard(1)
                     continue
                 del self.buffer[:codec.size]
+                if codec is MAG_PACKET:
+                    # Independent diagnostic stream; never pass to IMU recording/control.
+                    self.stats["mag_frames"] += 1
+                    continue
                 if codec is CONTROL:
                     self.records.append(ControlReply(*fields[4:-1]))
                     self.stats["control_replies"] += 1

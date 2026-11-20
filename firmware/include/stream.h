@@ -56,6 +56,10 @@ typedef struct {
 extern volatile imu_diagnostics_t g_imu_diagnostics;
 extern volatile uint8_t g_last_imu_frame[IMU_FRAME_SIZE];
 
+#define STREAM_MAG_SIZE 72u
+/* Main context, one bounded slot. True iff an unsent record was overwritten. */
+bool stream_publish_mag(const uint8_t frame[STREAM_MAG_SIZE]);
+
 void stream_set_active(bool active);
 void stream_sample(uint8_t type, uint64_t timestamp_us,
                    const int16_t xyz[3], bool valid, bool read_was_slow);

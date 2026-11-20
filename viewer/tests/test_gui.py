@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
+import threading
 import time
 import unittest
 import serial
@@ -9,9 +10,19 @@ from pathlib import Path
 from unittest.mock import patch
 from PySide6 import QtWidgets
 from imu_viewer.gui import Window
+from imu_viewer.workflow import export_recording
 from test_capture import FakeSerial, FakeCamera
 
 class GuiTests(unittest.TestCase):
+    def setUp(self):
+        # Unexpected modal dialogs must fail, not hang headless regression runs.
+        def unexpected_dialog(*args, **kwargs):
+            raise AssertionError(f"Unexpected modal dialog: {args[1:]}")
+        for name in ("critical", "warning"):
+            patcher = patch.object(QtWidgets.QMessageBox, name, side_effect=unexpected_dialog)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_connect_preview_record_stop_preview_disconnect(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         parent = Path(__file__).resolve().parents[1]/"test-results"
@@ -36,12 +47,12 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(window.ports.count(), 1)
                 window.resolution.addItem("16×8")
                 window.resolution.setCurrentText("16×8")
-                window.output.setText(temp)
+                window.output.setText(str(Path(temp)/"recordings"))
                 window.connect_devices()
                 connection = window.connection
                 self.assertIsNotNone(connection)
                 deadline = time.perf_counter()+3
-                while not connection.metrics["camera_frames"] and time.perf_counter()<deadline:
+                while (not connection.metrics["camera_frames"] or not connection.metrics["imu_frames"]) and time.perf_counter()<deadline:
                     app.processEvents()
                     time.sleep(.01)
                 for _ in range(15):
@@ -78,12 +89,55 @@ class GuiTests(unittest.TestCase):
                 expanded.close()
                 app.processEvents()
                 self.assertEqual(window.waveforms.expanded, {})
-                window.stop_recording()
-                deadline = time.perf_counter()+5
-                while window.recorder and time.perf_counter()<deadline:
-                    app.processEvents()
-                    time.sleep(.01)
+                entered, release = threading.Event(), threading.Event()
+                def blocked_export(source):
+                    self.assertTrue(recorder.done.is_set())
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test export timed out")
+                    return export_recording(source)
+                with patch("imu_viewer.gui.export_recording", side_effect=blocked_export):
+                    try:
+                        self.assertEqual(window.stop_button.text(), "完成录制")
+                        window.stop_button.click()
+                        popup = window.export_dialog
+                        self.assertTrue(popup.isVisible())
+                        self.assertIn("保存", popup.stage.text())
+                        deadline = time.perf_counter()+5
+                        while not entered.is_set() and time.perf_counter()<deadline:
+                            app.processEvents()
+                            time.sleep(.01)
+                        self.assertTrue(entered.is_set())
+                        self.assertTrue(window.busy)
+                        self.assertIs(window.export_dialog, popup)
+                        self.assertIn("正在导出", popup.stage.text())
+                        self.assertFalse(window.start_button.isEnabled())
+                        self.assertFalse(window.output.isEnabled())
+                        before_export = connection.metrics["camera_frames"]
+                        preview_key = window.preview_label.pixmap().cacheKey()
+                        for _ in range(15):
+                            app.processEvents()
+                            time.sleep(.02)
+                        self.assertGreater(connection.metrics["camera_frames"], before_export)
+                        self.assertNotEqual(window.preview_label.pixmap().cacheKey(), preview_key)
+                    finally:
+                        release.set()
+                        deadline = time.perf_counter()+5
+                        while (window.recorder is not None or window.busy) and time.perf_counter()<deadline:
+                            app.processEvents()
+                            time.sleep(.01)
                 self.assertIsNone(window.recorder)
+                self.assertFalse(window.busy)
+                self.assertIsNone(window.export_dialog)
+                self.assertIsNotNone(window.last_export)
+                self.assertEqual(window.last_export.parent, recorder.path.parent)
+                self.assertEqual(recorder.path.parent.parent, Path(temp)/"recordings")
+                self.assertEqual(recorder.path.name, "raw")
+                self.assertEqual(window.last_export.name, "export")
+                self.assertEqual({p.name for p in recorder.path.parent.iterdir()}, {"raw", "export"})
+                self.assertTrue((window.last_export/"imu_image.csv").exists())
+                self.assertFalse((window.last_export/"EXPORT_INCOMPLETE").exists())
+                self.assertTrue((recorder.path/"usb.bin").exists())
                 self.assertIsNone(recorder.error)
                 self.assertGreater(recorder.writer.images, 0)
                 self.assertEqual(recorder.writer.samples, recorder.metrics["imu_frames"])
@@ -164,11 +218,11 @@ class GuiTests(unittest.TestCase):
                     time.sleep(.01)
                 window.resolution.addItem("16×8")
                 window.resolution.setCurrentText("16×8")
-                window.output.setText(temp)
+                window.output.setText(str(Path(temp)/"recordings"))
                 window.connect_devices()
                 connection = window.connection
                 deadline = time.perf_counter()+3
-                while not connection.metrics["camera_frames"] and time.perf_counter()<deadline:
+                while (not connection.metrics["camera_frames"] or not connection.metrics["imu_frames"]) and time.perf_counter()<deadline:
                     app.processEvents()
                     time.sleep(.01)
                 window.start_recording()
@@ -191,6 +245,10 @@ class GuiTests(unittest.TestCase):
                 self.assertTrue(connection.done.is_set())
                 self.assertTrue(recorder.done.is_set())
                 self.assertTrue(recorder.writer.closed)
+                self.assertIsNotNone(window.last_export)
+                self.assertTrue((window.last_export/"export.json").exists())
+                self.assertEqual(window.last_export.parent, recorder.path.parent)
+                self.assertFalse(window.busy)
                 self.assertIsNone(recorder.error)
                 self.assertTrue(all(c.closed for c in FakeCamera.instances))
                 self.assertTrue(all(s.closed for s in FakeSerial.instances))

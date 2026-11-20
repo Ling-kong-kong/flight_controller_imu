@@ -75,13 +75,18 @@ add_library(tinyusb STATIC
   "${TUSB_DIR}/portable/synopsys/dwc2/dwc2_common.c")
 target_link_libraries(tinyusb PUBLIC platform_config)
 
+add_library(bmm150 STATIC third_party/bmm150/bmm150.c)
+target_link_libraries(bmm150 PUBLIC platform_config)
+target_include_directories(bmm150 PUBLIC third_party/bmm150)
+target_compile_definitions(bmm150 PUBLIC BMM150_USE_FLOATING_POINT)
+
 file(GLOB APP_SOURCES CONFIGURE_DEPENDS firmware/src/*.c)
 add_executable(imu_firmware ${APP_SOURCES} cmake/runtime.c
   third_party/cmsis_device_h7/Source/Templates/gcc/startup_stm32h743xx.s)
 set_target_properties(imu_firmware PROPERTIES SUFFIX ".elf")
 target_compile_options(imu_firmware PRIVATE
   "$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Werror;-Wshadow;-Wformat=2;-Wundef>")
-target_link_libraries(imu_firmware PRIVATE stm32_hal tinyusb m)
+target_link_libraries(imu_firmware PRIVATE stm32_hal tinyusb bmm150 m)
 target_link_options(imu_firmware PRIVATE
   -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard
   -nostartfiles --specs=nano.specs --specs=nosys.specs

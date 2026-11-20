@@ -10,7 +10,7 @@ from .capture import Config, LiveConnection, BASE, discover_ports, camera_invent
 from .timing import HOST_WARNING as WARNING
 from .waveform import WaveformPanel
 from .attitude import AttitudePanel, AttitudeDetailsDialog
-from .storage import export_euroc
+from .workflow import validate_output_root, resolve_raw_session, next_export_destination, export_recording
 
 APP_STYLESHEET = """
         QWidget { background:#182536; color:#dce5f2; font-size:13px; }
@@ -24,6 +24,91 @@ APP_STYLESHEET = """
 
 class Bridge(QtCore.QObject):
     result = QtCore.Signal(str, object, bool)
+
+class ElidedLabel(QtWidgets.QLabel):
+    """Keep device inventories on one line; the tooltip retains the full text."""
+    def __init__(self, text):
+        super().__init__(text)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self.setToolTip(text)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setPen(self.palette().color(QtGui.QPalette.WindowText))
+        text = self.fontMetrics().elidedText(self.text().replace("\n", " | "), QtCore.Qt.ElideRight, self.contentsRect().width())
+        painter.drawText(self.contentsRect(), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
+
+
+class ExportProgressDialog(QtWidgets.QDialog):
+    """Non-blocking stage indicator; never imply a percentage we cannot measure."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.running = True
+        self.setWindowTitle("正在保存并导出")
+        self.setWindowModality(QtCore.Qt.NonModal)
+        self.setWindowFlag(QtCore.Qt.WindowContextHelpButtonHint, False)
+        self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, False)
+        self.setFixedWidth(460)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        self.stage = QtWidgets.QLabel()
+        self.stage.setStyleSheet("font-size:16px;font-weight:700;color:#75d9cd")
+        self.stage.setWordWrap(True)
+        layout.addWidget(self.stage)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        layout.addWidget(self.progress)
+        self.details = QtWidgets.QLabel()
+        self.details.setTextFormat(QtCore.Qt.PlainText)
+        self.details.setWordWrap(True)
+        self.details.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.details)
+        self.hint = QtWidgets.QLabel("请等待完成，勿强制退出程序。设备预览可继续。")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+        self.close_button = QtWidgets.QPushButton("关闭")
+        self.close_button.clicked.connect(self.accept)
+        self.close_button.hide()
+        layout.addWidget(self.close_button)
+
+    def set_stage(self, text, details):
+        self.stage.setText(text)
+        self.details.setText(details)
+        self.adjustSize()
+
+    def complete(self, error=None):
+        self.running = False
+        if error is None:
+            self.accept()
+        else:
+            self.setWindowTitle("导出失败")
+            self.stage.setStyleSheet("font-size:16px;font-weight:700;color:#ffb3ad")
+            self.set_stage("导出失败 · 原始数据保留", str(error))
+            self.progress.hide()
+            self.hint.setText("请检查错误及保存目录，关闭提示后可使用「重新导出…」重试。")
+            self.close_button.show()
+            self.adjustSize()
+
+    def accept(self):
+        if not self.running:
+            super().accept()
+
+    def reject(self):
+        if not self.running:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.running:
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
 
 class StereoPreview(QtWidgets.QWidget):
     """Aspect-fit painting independent of image size hints and capture refreshes."""
@@ -103,6 +188,9 @@ class Window(QtWidgets.QMainWindow):
         self.recorder = None
         self.closing = False
         self.last_session = None
+        self.last_export = None
+        self._export_error_message = None
+        self.export_dialog = None
         self.inventory = []
         self.busy = False
         self.last_rates = None
@@ -115,8 +203,8 @@ class Window(QtWidgets.QMainWindow):
         main = QtWidgets.QWidget()
         self.setCentralWidget(main)
         layout = QtWidgets.QVBoxLayout(main)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(2)
         header = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("H743 / STEREO + IMU")
         title.setStyleSheet("font-size:19px;font-weight:700;color:#75d9cd")
@@ -163,12 +251,12 @@ class Window(QtWidgets.QMainWindow):
         self.start_button = QtWidgets.QPushButton("开始录制")
         self.start_button.setStyleSheet("background:#117c72;font-weight:700")
         self.start_button.clicked.connect(self.start_recording)
-        self.stop_button = QtWidgets.QPushButton("停止录制")
-        self.stop_button.setToolTip("停止并完成写盘，设备保持连接")
+        self.stop_button = QtWidgets.QPushButton("完成录制")
+        self.stop_button.setToolTip("完成录制后弹窗显示保存和自动导出状态，设备保持连接、预览继续")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_recording)
-        self.export_button = QtWidgets.QPushButton("导出数据…")
-        self.export_button.setToolTip("导出全部 IMU 和图像，附逐 IMU 图像关联表；一对一最近接收时间匹配，默认容差 20 ms，未匹配图像字段为空。")
+        self.export_button = QtWidgets.QPushButton("重新导出…")
+        self.export_button.setToolTip("完成录制后自动导出；此按钮仅用于重试或旧会话。导出全部 IMU 和图像，附逐 IMU 图像关联表；一对一最近接收时间匹配，默认容差 20 ms，未匹配图像字段为空。")
         self.export_button.clicked.connect(self.export_session)
         actions = QtWidgets.QHBoxLayout()
         for w in (self.ports, self.connect_button, self.disconnect_button, self.start_button,
@@ -192,12 +280,15 @@ class Window(QtWidgets.QMainWindow):
             settings.addWidget(widget, 0, col)
         self.output = QtWidgets.QLineEdit(str(BASE/"recordings"))
         self.output.setMinimumWidth(100)
+        self.output.setToolTip("每次录制新建一个会话文件夹，内含 raw/ 原始数据和 export/ 自动导出结果")
         self.browse = QtWidgets.QPushButton("保存位置…")
         self.browse.clicked.connect(self.choose_directory)
-        settings.addWidget(self.output, 1, 0, 1, 4)
-        settings.addWidget(self.browse, 1, 4)
-        self.camera_label = QtWidgets.QLabel("正在枚举摄像头；索引需以预览实测确认")
-        self.camera_label.setWordWrap(True)
+        paths = QtWidgets.QHBoxLayout()
+        paths.addWidget(QtWidgets.QLabel("保存位置"))
+        paths.addWidget(self.output, 1)
+        paths.addWidget(self.browse)
+        settings.addLayout(paths, 1, 0, 1, 5)
+        self.camera_label = ElidedLabel("正在枚举摄像头；索引需以预览实测确认")
         settings.addWidget(self.camera_label, 2, 0, 1, 5)
         layout.addWidget(self.settings_panel)
         self.settings_button.toggled.connect(self.settings_panel.setVisible)
@@ -220,6 +311,8 @@ class Window(QtWidgets.QMainWindow):
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.status)
+        self.export_status = ElidedLabel("录制流程：开始录制 → 完成录制 → 保存并自动导出（原始 / 导出分目录）")
+        layout.addWidget(self.export_status)
         self.error_banner = QtWidgets.QLabel()
         self.error_banner.setWordWrap(True)
         self.error_banner.setStyleSheet("background:#672c32;color:#ffe2df;padding:6px")
@@ -256,7 +349,8 @@ class Window(QtWidgets.QMainWindow):
         available = screen.availableGeometry()
         self.resize(min(1440, available.width()-24), min(960, available.height()-50))
         self.controls = [self.ports,self.refresh,self.camera,self.backend,self.resolution,
-                         self.fps,self.output,self.browse,self.start_button,self.export_button]
+                         self.fps,self.output,self.browse,
+                         self.start_button,self.export_button]
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(100)
@@ -297,7 +391,7 @@ class Window(QtWidgets.QMainWindow):
     @QtCore.Slot(str, object, bool)
     def job_result(self, name, value, error):
         if name == "devices":
-            self.refresh.setEnabled(self.connection is None and not self.closing)
+            self.refresh.setEnabled(self.connection is None and not self.busy and not self.closing)
             if error:
                 self.log.appendPlainText(str(value))
                 return
@@ -312,7 +406,18 @@ class Window(QtWidgets.QMainWindow):
             self.set_recording_controls(False)
             self.log.appendPlainText(("导出失败: " if error else "导出完成: ") + str(value))
             if error:
-                QtWidgets.QMessageBox.warning(self,"导出失败",str(value))
+                self._export_error_message = str(value)
+                self.export_status.setText(str(value))
+                self.error_banner.setText(str(value))
+                self.error_banner.show()
+            else:
+                self.last_export = Path(value["destination"])
+                self.export_status.setText(f'导出完成 · 原始: {value["source"]}\n导出: {value["destination"]}')
+            if self.export_dialog is not None:
+                self.export_dialog.complete(str(value) if error else None)
+                if not error:
+                    self.export_dialog.deleteLater()
+                    self.export_dialog = None
 
     def choose_directory(self):
         directory = QtWidgets.QFileDialog.getExistingDirectory(self,"选择录制目录",self.output.text())
@@ -380,7 +485,7 @@ class Window(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "无法重新校准", str(exc))
 
     def connect_devices(self):
-        if self.connection is not None:
+        if self.connection is not None or self.busy or self.closing:
             return
         port = self.ports.currentData()
         if not port:
@@ -412,14 +517,16 @@ class Window(QtWidgets.QMainWindow):
             self.set_recording_controls()
 
     def start_recording(self):
-        if self.connection is None or self.recorder is not None:
+        if self.connection is None or self.recorder is not None or self.busy or self.closing:
             return
         try:
-            recorder = self.connection.start_recording(self.output.text())
+            output_root = validate_output_root(self.output.text())
+            recorder = self.connection.start_recording(str(output_root))
             self.recorder = recorder
             self.last_session = recorder.path
             self.error_banner.hide()
             self.set_recording_controls(True)
+            self.export_status.setText(f"正在录制 · 原始: {recorder.path}\n完成录制后自动导出至: {recorder.path.parent / 'export'}")
             self.log.appendPlainText("录制开始: "+str(recorder.path))
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self,"无法开始录制",str(exc))
@@ -427,8 +534,10 @@ class Window(QtWidgets.QMainWindow):
     def stop_recording(self):
         if self.connection is not None and self.recorder is not None:
             self.connection.stop_recording()
+            self.show_export_progress("正在保存原始数据，随后自动导出…", self.recorder.path)
+            self.export_status.setText("保存收尾中，随后自动导出…")
             self.set_recording_controls()
-            self.log.appendPlainText("录制已停止，正在排空写盘并生成接收时间索引；设备保持连接、预览继续。")
+            self.log.appendPlainText("录制已停止，正在排空写盘并生成接收时间索引，随后自动导出；设备保持连接、预览继续。")
 
     def show_recorded_attitude(self):
         source = QtWidgets.QFileDialog.getExistingDirectory(
@@ -436,10 +545,10 @@ class Window(QtWidgets.QMainWindow):
         if not source:
             return
         try:
-            path = Path(source)
+            path = resolve_raw_session(source)
             session = json.loads((path/"session.json").read_text(encoding="utf8"))
             if not session.get("finalized"):
-                raise ValueError("请先停止录制并等待写盘完成")
+                raise ValueError("请先完成录制并等待写盘完成")
             dialog = AttitudeDetailsDialog(path, self)
             try:
                 dialog.exec()
@@ -448,21 +557,60 @@ class Window(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "无法读取姿态详情", str(exc))
 
+    def show_export_progress(self, stage, source, destination=None):
+        if self.export_dialog is not None and not self.export_dialog.running:
+            self.export_dialog.close()
+            self.export_dialog.deleteLater()
+            self.export_dialog = None
+        if self.export_dialog is None:
+            self.export_dialog = ExportProgressDialog(self)
+        details = f"原始数据：{source}"
+        if destination is not None:
+            details += f"\n导出结果：{destination}"
+        self.export_dialog.set_stage(stage, details)
+        self.export_dialog.show()
+        self.export_dialog.raise_()
+
+    def begin_export(self, source):
+        source = resolve_raw_session(source)
+        destination = next_export_destination(source)
+        if self.error_banner.text() == self._export_error_message:
+            self.error_banner.hide()
+        self._export_error_message = None
+        self.busy = True
+        self.last_export = None
+        self.set_recording_controls()
+        self.show_export_progress("正在导出，请稍候…", source, destination)
+        self.export_status.setText(f"正在后台导出 · 原始: {source}\n导出: {destination}（完成前请勿退出）")
+        self.log.appendPlainText(f"后台导出: {source} → {destination}")
+        # Immutable paths only: no Qt widgets accessed by the worker.
+        self.task("export", lambda: export_recording(source))
+
     def export_session(self):
+        if self.recorder is not None or self.busy or self.closing:
+            return
         source = QtWidgets.QFileDialog.getExistingDirectory(
-            self,"选择已完成的原始会话",str(self.last_session or BASE/"recordings"))
+            self, "选择需重新导出的会话文件夹或 raw 目录", str(self.last_session or self.output.text()))
         if not source:
             return
-        parent = QtWidgets.QFileDialog.getExistingDirectory(self,"选择导出父目录",str(BASE))
-        if not parent:
+        self.begin_export(Path(source))
+
+    def finish_recording(self):
+        sink = self.recorder
+        if sink is None or not sink.done.is_set():
             return
-        destination = Path(parent)/(Path(source).name+"_euroc")
-        self.busy = True
-        self.set_recording_controls(False)
-        self.log.appendPlainText("后台导出: "+str(destination))
-        self.task("export", lambda: export_euroc(source,destination))
+        # Detach exactly once, before scheduling export, including disconnect /
+        # close / device-error stops. done means writers and finalization ended.
+        self.recorder = None
+        if sink.error:
+            self.error_banner.setText("录制错误: " + str(sink.error))
+            self.error_banner.show()
+        self.log.appendPlainText(("录制错误: "+sink.error) if sink.error else "原始录制保存完成，开始自动导出。")
+        self.log.appendPlainText("接收时间结果: "+json.dumps(sink.report, ensure_ascii=False))
+        self.begin_export(sink.path)
 
     def tick(self):
+        self.finish_recording()
         r = self.connection
         if r is None:
             self.attitude_panel.refresh(connected=False)
@@ -491,7 +639,8 @@ class Window(QtWidgets.QMainWindow):
             self._last_preview_image = image
         disk = self.recorder.snapshot() if self.recorder else None
         saving_text = ("录制收尾中 / 预览继续" if self.recorder and self.recorder.stop_event.is_set()
-                       else "正在录制" if self.recorder else "仅实时预览（不写盘）")
+                       else "正在录制" if self.recorder else "后台导出中 / 预览继续" if self.busy
+                       else "仅实时预览（不写盘）")
         disk_text = (f'已写 IMU {disk["written_imu"]:,} / 双目 {disk["written_images"]:,} | '
                      f'队列 USB {disk["usb_queue"]} · 相机 {disk["camera_queue"]} | '
                      f'剩余 {disk["free_bytes"]/1024**3:.1f} GiB / 峰值 RSS {disk["rss_peak_bytes"]/1024**2:.0f} MiB'
@@ -523,11 +672,6 @@ class Window(QtWidgets.QMainWindow):
                 "同一 USB 批次共享时间戳；接收时间不是采样 / 曝光时间。\n"
                 f'相机媒体时间异常 {s["camera_media_timestamp_anomalies"]} 次（保留原值，不影响接收时间轴）；'
                 "波形横轴仍为 H743 相对时间。")
-        if self.recorder is not None and self.recorder.done.is_set():
-            sink = self.recorder
-            self.log.appendPlainText(("录制错误: "+sink.error) if sink.error else "录制完成；设备仍连接时可继续预览或再次录制。")
-            self.log.appendPlainText("接收时间结果: "+json.dumps(sink.report,ensure_ascii=False))
-            self.recorder = None
         if r.done.is_set():
             self.log.appendPlainText(("连接错误: "+r.error) if r.error else "设备已断开。")
             self.connection = None
@@ -546,6 +690,10 @@ class Window(QtWidgets.QMainWindow):
             self.log.appendPlainText("正在安全关闭，请等待设备释放及后台任务完成…")
             event.ignore()
         else:
+            if self.export_dialog is not None:
+                self.export_dialog.close()
+                self.export_dialog.deleteLater()
+                self.export_dialog = None
             self.waveforms.shutdown()
             event.accept()
 

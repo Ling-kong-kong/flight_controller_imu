@@ -27,6 +27,18 @@ static uint64_t previous_us[2];
 static bool have_previous[2];
 static uint16_t pending_flags;
 static uint64_t last_flush_us;
+static uint8_t mag_pending[STREAM_MAG_SIZE];
+static bool mag_pending_ready;
+
+bool stream_publish_mag(const uint8_t frame[STREAM_MAG_SIZE])
+{
+    if (!active) return false;
+    const bool overwritten = mag_pending_ready;
+    memcpy(mag_pending, frame, sizeof(mag_pending));
+    mag_pending_ready = true;
+    return overwritten;
+}
+
 typedef struct {
     uint64_t time;
     int16_t accel[3], gyro[3];
@@ -82,6 +94,7 @@ void stream_set_active(bool enabled)
     consumed = 0;
     sequence = 0;
     ++session;
+    mag_pending_ready = false;
     control_used = 0;
     control_requested = control_reply_ready = control_cached = false;
     pending_flags = enabled ? IMU_FLAG_SESSION : 0u;
@@ -359,6 +372,12 @@ void stream_usb_task(void)
         __DMB();
         consumed = tail + 1u;
         ++g_imu_diagnostics.usb_frames;
+    }
+    if (mag_pending_ready && consumed == produced &&
+        tud_cdc_write_available() >= STREAM_MAG_SIZE) {
+        if (tud_cdc_write(mag_pending, STREAM_MAG_SIZE) != STREAM_MAG_SIZE)
+            board_fatal(8u);
+        mag_pending_ready = false;
     }
     (void)tud_cdc_write_flush();
 }

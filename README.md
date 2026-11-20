@@ -2,7 +2,7 @@
 
 独立的裸机 C 工程，默认从 **Flash `0x08000000`** 启动，用 ST-Link/SWD 直接烧录，不需要飞控固件或 bootloader。芯片、晶振、SPI、USB、电源引脚取自 [原始板级配置](docs/original-hwdef.dat)。
 
-**当前版本每秒输出 1000 帧，每帧包含原始六轴、共同时间戳、四元数及 roll/pitch/yaw。** STM32H743 在主循环运行六轴 Mahony 姿态融合；USB 未连接时也持续更新，重连不重置姿态。不使用 BMM150，yaw 是静置校准归零、允许漂移的相对航向，不是磁航向或真北。加热器始终关闭。
+**当前版本每秒输出 1000 帧，每帧包含原始六轴、共同时间戳、四元数及 roll/pitch/yaw。** STM32H743 在主循环运行六轴 Mahony 姿态融合；USB 未连接时也持续更新，重连不重置姿态。BMM150 仅独立诊断采集、不参与姿态融合，yaw 是静置校准归零、允许漂移的相对航向，不是磁航向或真北。加热器始终关闭。
 
 > 融合安装旋转沿用历史 `ROTATION_PITCH_180`（X/Z 取反），原始六轴不变；历史配置不等于实板方向已核验，完整实板验收仍未完成。历史 `release/`、`docs/validation.json` 和 `release/BUILD_INFO.json` 不代表本次姿态功能的交付或验收结果。
 
@@ -16,6 +16,12 @@
 | 陀螺仪内部采样 | 2000 Hz，±2000 °/s，230 Hz 带宽 |
 | SPI | SPI3，Mode 3，6.25 MHz，DRDY 中断读取 |
 | USB | PA11/PA12，Full Speed CDC ACM 虚拟串口，打开并置 DTR 即输出 |
+
+## BMM150 通信与磁场采集
+
+新增 BMM150 独立采集：I²C4 PF14/PF15、7 位地址 `0x10`，核对 Chip ID `0x32`、读取工厂 trim 并补偿为 µT，正常模式约 25 Hz。磁场以独立 **72 字节 IMU2 v1/type 4** 帧与原有 76 字节 IMU 帧混合发送，不改六轴/姿态定义。磁场保留芯片轴，未应用安装旋转，**不做硬/软铁标定，也不纠正 yaw**。
+
+操作、协议和验收边界见 **[BMM150 通信与磁场采集指南](docs/bmm150-validation.md)**。专用 `tools/mag_capture.py` 可采集和回放磁场 CSV，并同时统计原有 1 kHz IMU 链路；当前 GUI 只识别并跳过磁帧，不显示磁场。源代码和软件测试就绪不代表已经烧录或通过实板验收；实测文件仅存本地。
 
 ## 时间同步的范围
 
@@ -172,6 +178,8 @@ python3 -m unittest discover -s tests -v
 
 - `firmware/src/board.c`：时钟、电源、SPI、微秒时基、定时合帧调度、EXTI。
 - `firmware/src/bmi088.c`：初始化、配置回读和原始数据读取。
+- `firmware/src/board_i2c.c` / `mag.c`：非阻塞 I²C4、BMM150 配置/回读、工厂补偿及独立磁场诊断。
+- `tools/mag_capture.py`：混合流磁场采集、CSV、统计与离线回放。
 - `firmware/src/stream.c`：历史选样、快照队列、主循环融合调度、质量标志、发送队列、手动重校准命令及 USB 会话。
 - `firmware/src/fusion.c`：静置校准、独立安装旋转、六轴 Mahony、四元数/Euler 与失效重置。
 - `firmware/src/protocol.c`：二进制帧及 CRC。
