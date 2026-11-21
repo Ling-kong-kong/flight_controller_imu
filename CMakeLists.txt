@@ -6,6 +6,8 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 project(bmi088_raw_imu VERSION 3.0.0 LANGUAGES C ASM)
 
+option(ENABLE_EXPERIMENTAL_MAG_FUSION "Enable experimental BMM150 relative yaw aiding" ON)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -84,6 +86,9 @@ file(GLOB APP_SOURCES CONFIGURE_DEPENDS firmware/src/*.c)
 add_executable(imu_firmware ${APP_SOURCES} cmake/runtime.c
   third_party/cmsis_device_h7/Source/Templates/gcc/startup_stm32h743xx.s)
 set_target_properties(imu_firmware PROPERTIES SUFFIX ".elf")
+target_compile_definitions(imu_firmware PRIVATE
+  FUSION_MAG_ENABLE=$<BOOL:${ENABLE_EXPERIMENTAL_MAG_FUSION}>)
+
 target_compile_options(imu_firmware PRIVATE
   "$<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Werror;-Wshadow;-Wformat=2;-Wundef>")
 target_link_libraries(imu_firmware PRIVATE stm32_hal tinyusb bmm150 m)

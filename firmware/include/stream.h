@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "mag_heading.h"
 
 #define IMU_FRAME_SIZE 76u
 #define IMU_FUSION_QUEUE_CAPACITY 64u
@@ -25,6 +26,9 @@
 #define IMU_FLAG_CALIBRATING 0x0400u
 #define IMU_FLAG_ATTITUDE_VALID 0x0800u
 #define IMU_FLAG_FUSION_RESET 0x1000u
+#define IMU_FLAG_MAG_AIDING MAG_HEADING_AIDING
+#define IMU_FLAG_MAG_REJECTED MAG_HEADING_REJECTED
+#define IMU_FLAG_MAG_REFERENCE MAG_HEADING_REFERENCE
 
 typedef struct {
     uint32_t drdy[2];
@@ -54,6 +58,9 @@ typedef struct {
 
 /* Counters are also available via SWD; no text is mixed into USB data (binary control replies are permitted). */
 extern volatile imu_diagnostics_t g_imu_diagnostics;
+/* Separate SWD layout; experimental flags do not affect six-axis validity. */
+extern volatile mag_heading_diagnostics_t g_mag_fusion_diagnostics;
+void stream_magnetic_sample(const magnetic_sample_t *sample);
 extern volatile uint8_t g_last_imu_frame[IMU_FRAME_SIZE];
 
 #define STREAM_MAG_SIZE 72u

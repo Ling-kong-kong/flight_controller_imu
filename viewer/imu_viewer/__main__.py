@@ -1,13 +1,12 @@
-"""GUI and independently runnable acquisition/export/verification commands."""
+"""GUI and independently runnable acquisition/saving/verification commands."""
 import argparse
 import json
-import math
 import sys
 import time
 from pathlib import Path
 from .capture import Config, Recorder, BASE, discover_ports, camera_inventory, select_port
-from .storage import finalize, export_euroc
-from .workflow import validate_output_root, resolve_raw_session, export_recording
+from .storage import finalize
+from .workflow import validate_output_root, resolve_raw_session
 
 def main():
     parser = argparse.ArgumentParser(description="H743 stereo viewer — read-only CDC; host receive timestamps; exposure timing unverified")
@@ -15,7 +14,7 @@ def main():
     gui = sub.add_parser("gui", help="Open the desktop viewer")
     gui.add_argument("--smoke-seconds", type=float, default=0)
     sub.add_parser("devices", help="List USB serial identities and Windows camera inventory")
-    record = sub.add_parser("record", help="Headless joint acquisition followed by automatic export")
+    record = sub.add_parser("record", help="Headless joint acquisition with direct saved IMU/image associations")
     record.add_argument("--port")
     record.add_argument("--serial-number")
     record.add_argument("--camera", type=int, default=0)
@@ -26,13 +25,8 @@ def main():
     record.add_argument("--seconds", type=float, default=600)
     record.add_argument("--output", default=str(BASE / "recordings"))
     record.add_argument("--disk-reserve-gib", type=float, default=1)
-    recalc = sub.add_parser("finalize", help="Rebuild time indexes (legacy sessions retain their original model)")
+    recalc = sub.add_parser("finalize", help="Rebuild saved time and IMU/image association indexes (stopped sessions only)")
     recalc.add_argument("session", type=Path)
-    export = sub.add_parser("export", help="Export host-time EuRoC-shaped data and all-IMU image associations")
-    export.add_argument("session", type=Path)
-    export.add_argument("destination", type=Path)
-    export.add_argument("--match-tolerance-ms", type=float, default=20.0,
-                        help="One-to-one image association tolerance in ms (default: 20)")
     verify = sub.add_parser("verify", help="Audit raw USB/CSV/stereo/model integrity without devices")
     verify.add_argument("session", type=Path)
     verify.add_argument("--decode-all", action="store_true")
@@ -50,11 +44,6 @@ def main():
             print(json.dumps(verify_session(resolve_raw_session(args.session), args.decode_all), ensure_ascii=False, indent=2))
         elif args.command == "finalize":
             print(json.dumps(finalize(resolve_raw_session(args.session)), ensure_ascii=False, indent=2))
-        elif args.command == "export":
-            if not math.isfinite(args.match_tolerance_ms * 1_000_000) or args.match_tolerance_ms < 0:
-                raise ValueError("--match-tolerance-ms must be finite and non-negative")
-            print(json.dumps(export_euroc(resolve_raw_session(args.session), args.destination,
-                             round(args.match_tolerance_ms * 1_000_000)), ensure_ascii=False, indent=2))
         elif args.command == "record":
             if args.seconds <= 0:
                 raise ValueError("--seconds must be positive")
@@ -81,11 +70,14 @@ def main():
                 if not recorder.wait(100):
                     print("Recorder shutdown timed out; session may be incomplete", file=sys.stderr)
                     return 2
-            print("Raw recording finalized; exporting...", flush=True)
-            result = export_recording(path)
-            print(json.dumps(dict(path=str(path), quality=recorder.snapshot(),
-                                  alignment=recorder.report, export=result), ensure_ascii=False, indent=2), flush=True)
-            return 2 if recorder.error else 0
+            if recorder.error:
+                print(f"保存失败: {recorder.error}；已写入数据保留在 {path}，可能不完整", file=sys.stderr)
+                return 2
+            print("保存完成", flush=True)
+            print(json.dumps(dict(path=str(path), association_table=str(path / "imu_image.csv"),
+                                  quality=recorder.snapshot(), timing=recorder.report),
+                             ensure_ascii=False, indent=2), flush=True)
+            return 0
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

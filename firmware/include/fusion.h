@@ -2,6 +2,11 @@
 #define IMU_FUSION_H
 #include <stdbool.h>
 #include <stdint.h>
+#include "mag_heading.h"
+
+#ifndef FUSION_MAG_ENABLE
+#define FUSION_MAG_ENABLE 1
+#endif
 
 #define FUSION_WINDOW 200u
 /* Detector ONLY: y += alpha*(x-y), alpha=1-exp(-2*pi*30/1000).
@@ -21,6 +26,12 @@ typedef struct {
     bool reset;
 } attitude_t;
 
+typedef enum {
+    FUSION_CAL_STATIONARY, FUSION_CAL_MAGNETIC,
+    FUSION_CAL_READY, FUSION_CAL_SIX_AXIS
+} fusion_calibration_phase_t;
+#define FUSION_MAG_WAIT_US 5000000u
+
 typedef struct {
     /* Raw accel (g), detector-filtered gyro (deg/s); not fusion inputs. */
     float window[FUSION_WINDOW][6];
@@ -34,10 +45,18 @@ typedef struct {
     float bias[3];
     bool started, have_source, initialized, reset_pending;
     uint32_t resets;
+    fusion_calibration_phase_t phase;
+    uint64_t magnetic_wait_start;
     attitude_t attitude;
+    mag_heading_t magnetic;
 } fusion_t;
 
+/* Main context, USB-independent. Default build enables experimental relative magnetic yaw aiding. */
+void fusion_submit_mag(fusion_t *state, const magnetic_sample_t *sample);
+uint16_t fusion_magnetic_flags(const fusion_t *state);
 void fusion_reset(fusion_t *state);
+/* 0 success, 1 invalid attitude, 2 Euler heading undefined near vertical. */
+unsigned fusion_heading_zero(fusion_t *state);
 void fusion_update(fusion_t *state, uint64_t timestamp_us,
                    const int16_t accel[3], const int16_t gyro[3],
                    uint32_t accel_age_us, uint32_t gyro_age_us, uint16_t flags);

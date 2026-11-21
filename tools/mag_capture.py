@@ -2,8 +2,9 @@
 """Read-only BMM150 diagnostics, preserving concurrent BMI088/attitude USB bytes.
 
 No command is sent to the MCU. Opening CDC asserts DTR only. Raw and compensated
-magnetic vectors use BMM150 register axes, NOT body FRD; no magnetic calibration
-or heading correction is applied. Timestamps are register-read completion times.
+magnetic vectors use BMM150 register axes, NOT body FRD. This tool does not apply
+hard/soft iron calibration or heading correction; firmware may independently aid
+relative yaw (inspect IMU v3 flags), without changing the raw magnetic frames. Timestamps are register-read completion times.
 """
 from __future__ import annotations
 import argparse
@@ -75,11 +76,11 @@ class Capture:
     def summary(self):
         elapsed = ((self.last_valid_us - self.first_valid_us)
                    if self.last_valid_us is not None else 0)
-        return dict(protocol="IMU2 v1 type4 72B; IMU2 v2/v3 unchanged",
-                    axes="BMM150 chip/register axes; no mounting rotation",
-                    magnetic_calibration="factory trim compensation only; no hard/soft iron calibration",
+        return dict(protocol="IMU2 v1 type4 72B; IMU2 v2/type3 48B or v3/type3 76B",
+                    axes="raw magnetic frames: BMM150 chip/register axes; no mounting rotation",
+                    magnetic_calibration="raw magnetic frames: factory trim compensation only; no hard/soft iron calibration",
                     timestamp="MCU register read completion, not conversion/DRDY time",
-                    yaw="six-axis relative yaw unchanged; magnetometer not fused",
+                    yaw="relative yaw; optional magnetic aid, inspect IMU v3 flags; no north reference",
                     parser=self.parser.summary(), imu=self.imu.summary(),
                     mag=self.mag.summary(), valid_samples=self.valid_samples,
                     invalid_frames=self.invalid_frames,

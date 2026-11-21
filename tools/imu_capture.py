@@ -23,6 +23,11 @@ FRAME_STRUCT = struct.Struct("<4sBBHIQhhhhhhIIHHI")
 MAG_PACKET = struct.Struct("<4sBBHIQhhhHfffHBBBBBBIIIIII")
 assert MAG_PACKET.size == 72
 CONTROL = struct.Struct("<4sBBHIIQII")
+FUSION_DIAGNOSTIC = struct.Struct("<4sBBHQIIIIIffIII")
+assert FUSION_DIAGNOSTIC.size == 56
+MAG_REASONS = ("waiting", "ok", "imu", "motion", "quality", "time", "sequence",
+               "stale", "overflow", "norm", "horizontal", "tilt_reserved", "dip",
+               "innovation", "unstable")
 FRAME_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
 ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 LEGACY_MAGIC = b"IMU1"
@@ -35,6 +40,8 @@ FLAG_NAMES = {
     16: "session_start", 32: "accel_stale", 64: "gyro_stale",
     128: "accel_drdy_interval", 256: "gyro_drdy_interval", 512: "history_missing",
     1024: "calibrating", 2048: "attitude_valid", 4096: "fusion_reset",
+    8192: "mag_heading_aiding", 16384: "mag_heading_rejected",
+    32768: "mag_heading_reference",
 }
 
 
@@ -122,10 +129,36 @@ class ControlReply:
     timestamp_us: int
     sequence: int
 
+    operation: int = 1
+
     def encode(self) -> bytes:
-        data = CONTROL.pack(MAGIC, 1, 0x11, CONTROL.size, self.request_id,
+        data = CONTROL.pack(MAGIC, 1, 0x13 if self.operation == 2 else 0x11, CONTROL.size, self.request_id,
                             self.status, self.timestamp_us, self.sequence, 0)
         return data[:-4] + struct.pack("<I", zlib.crc32(data[:-4]))
+
+
+
+@dataclass(frozen=True)
+class FusionDiagnostic:
+    timestamp_us: int
+    sequence: int
+    phase: int
+    reason: int
+    recovery_count: int
+    recovery_elapsed_ms: int
+    innovation_deg: float
+    correction_rate_dps: float
+    flags: int
+    request_id: int
+
+    @property
+    def reason_name(self):
+        return MAG_REASONS[self.reason] if 0 <= self.reason < len(MAG_REASONS) else "unknown"
+
+    def encode(self):
+        values = [getattr(self, key) for key in self.__dataclass_fields__]
+        raw = FUSION_DIAGNOSTIC.pack(b"IMU2", 1, 0x12, 56, *values, 0)
+        return raw[:-4] + struct.pack("<I", zlib.crc32(raw[:-4]))
 
 
 @dataclass(frozen=True)
@@ -181,6 +214,7 @@ class StreamParser:
         self.frames = 0
         self.control_replies = 0
         self.mag_frames = 0
+        self.fusion_diagnostics = 0
         self.records = []
 
     def feed(self, data: bytes) -> list[Frame | PairedFrame]:
@@ -211,7 +245,8 @@ class StreamParser:
             paired = self.buffer[:4] == MAGIC
             version = self.buffer[4]
             mag = paired and version == 1 and self.buffer[5] == 4
-            control = paired and version == 1 and self.buffer[5] == 0x11
+            control = paired and version == 1 and self.buffer[5] in (0x11, 0x13)
+            diagnostic = paired and version == 1 and self.buffer[5] == 0x12
             size = (FRAME_V3.size if version == 3 else FRAME_SIZE) if paired else LEGACY_FRAME_SIZE
             valid_version = version in (2, 3) if paired else version == 1
             valid_type = self.buffer[5] == 3 if paired else self.buffer[5] in SENSOR_NAMES
@@ -219,6 +254,8 @@ class StreamParser:
                 size, valid_version, valid_type = MAG_PACKET.size, True, True
             if control:
                 size, valid_version, valid_type = CONTROL.size, True, True
+            if diagnostic:
+                size, valid_version, valid_type = FUSION_DIAGNOSTIC.size, True, True
             if (not valid_version or not valid_type
                     or struct.unpack_from("<H", self.buffer, 6)[0] != size):
                 self.header_errors += 1
@@ -237,9 +274,15 @@ class StreamParser:
                 self.mag_frames += 1
                 del self.buffer[:size]
                 continue
+            if diagnostic:
+                fields = FUSION_DIAGNOSTIC.unpack_from(self.buffer)
+                self.records.append(FusionDiagnostic(*fields[4:-1]))
+                self.fusion_diagnostics += 1
+                del self.buffer[:size]
+                continue
             if control:
                 fields = CONTROL.unpack_from(self.buffer)
-                self.records.append(ControlReply(*fields[4:-1]))
+                self.records.append(ControlReply(*fields[4:-1], operation=2 if fields[2] == 0x13 else 1))
                 self.control_replies += 1
                 del self.buffer[:size]
                 continue
@@ -257,7 +300,7 @@ class StreamParser:
 
     def summary(self) -> dict:
         return {"bytes_received": self.bytes_received, "valid_frames": self.frames,
-                "control_replies": self.control_replies, "mag_frames": self.mag_frames, "bytes_discarded": self.bytes_discarded,
+                "fusion_diagnostics": self.fusion_diagnostics, "control_replies": self.control_replies, "mag_frames": self.mag_frames, "bytes_discarded": self.bytes_discarded,
                 "crc_errors": self.crc_errors, "header_errors": self.header_errors,
                 "trailing_bytes": len(self.buffer)}
 

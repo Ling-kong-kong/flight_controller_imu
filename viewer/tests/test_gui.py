@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from PySide6 import QtWidgets
 from imu_viewer.gui import Window
-from imu_viewer.workflow import export_recording
+from imu_viewer.storage import finalize
 from test_capture import FakeSerial, FakeCamera
 
 class GuiTests(unittest.TestCase):
@@ -90,17 +90,17 @@ class GuiTests(unittest.TestCase):
                 app.processEvents()
                 self.assertEqual(window.waveforms.expanded, {})
                 entered, release = threading.Event(), threading.Event()
-                def blocked_export(source):
-                    self.assertTrue(recorder.done.is_set())
+                def blocked_finalize(source, quality=None):
+                    self.assertFalse(recorder.done.is_set())
                     entered.set()
                     if not release.wait(5):
-                        raise RuntimeError("test export timed out")
-                    return export_recording(source)
-                with patch("imu_viewer.gui.export_recording", side_effect=blocked_export):
+                        raise RuntimeError("test save timed out")
+                    return finalize(source, quality)
+                with patch("imu_viewer.capture.finalize", side_effect=blocked_finalize):
                     try:
                         self.assertEqual(window.stop_button.text(), "完成录制")
                         window.stop_button.click()
-                        popup = window.export_dialog
+                        popup = window.save_dialog
                         self.assertTrue(popup.isVisible())
                         self.assertIn("保存", popup.stage.text())
                         deadline = time.perf_counter()+5
@@ -108,17 +108,17 @@ class GuiTests(unittest.TestCase):
                             app.processEvents()
                             time.sleep(.01)
                         self.assertTrue(entered.is_set())
-                        self.assertTrue(window.busy)
-                        self.assertIs(window.export_dialog, popup)
-                        self.assertIn("正在导出", popup.stage.text())
+                        self.assertFalse(window.busy)
+                        self.assertIs(window.save_dialog, popup)
+                        self.assertIn("保存", popup.stage.text())
                         self.assertFalse(window.start_button.isEnabled())
                         self.assertFalse(window.output.isEnabled())
-                        before_export = connection.metrics["camera_frames"]
+                        before_save = connection.metrics["camera_frames"]
                         preview_key = window.preview_label.pixmap().cacheKey()
                         for _ in range(15):
                             app.processEvents()
                             time.sleep(.02)
-                        self.assertGreater(connection.metrics["camera_frames"], before_export)
+                        self.assertGreater(connection.metrics["camera_frames"], before_save)
                         self.assertNotEqual(window.preview_label.pixmap().cacheKey(), preview_key)
                     finally:
                         release.set()
@@ -128,15 +128,12 @@ class GuiTests(unittest.TestCase):
                             time.sleep(.01)
                 self.assertIsNone(window.recorder)
                 self.assertFalse(window.busy)
-                self.assertIsNone(window.export_dialog)
-                self.assertIsNotNone(window.last_export)
-                self.assertEqual(window.last_export.parent, recorder.path.parent)
+                self.assertIsNone(window.save_dialog)
                 self.assertEqual(recorder.path.parent.parent, Path(temp)/"recordings")
                 self.assertEqual(recorder.path.name, "raw")
-                self.assertEqual(window.last_export.name, "export")
-                self.assertEqual({p.name for p in recorder.path.parent.iterdir()}, {"raw", "export"})
-                self.assertTrue((window.last_export/"imu_image.csv").exists())
-                self.assertFalse((window.last_export/"EXPORT_INCOMPLETE").exists())
+                self.assertEqual({p.name for p in recorder.path.parent.iterdir()}, {"raw"})
+                self.assertTrue((recorder.path/"imu_image.csv").exists())
+                self.assertTrue((recorder.path/"association.json").exists())
                 self.assertTrue((recorder.path/"usb.bin").exists())
                 self.assertIsNone(recorder.error)
                 self.assertGreater(recorder.writer.images, 0)
@@ -245,9 +242,9 @@ class GuiTests(unittest.TestCase):
                 self.assertTrue(connection.done.is_set())
                 self.assertTrue(recorder.done.is_set())
                 self.assertTrue(recorder.writer.closed)
-                self.assertIsNotNone(window.last_export)
-                self.assertTrue((window.last_export/"export.json").exists())
-                self.assertEqual(window.last_export.parent, recorder.path.parent)
+                self.assertTrue((recorder.path/"imu_image.csv").exists())
+                self.assertTrue((recorder.path/"association.json").exists())
+                self.assertFalse((recorder.path.parent/"export").exists())
                 self.assertFalse(window.busy)
                 self.assertIsNone(recorder.error)
                 self.assertTrue(all(c.closed for c in FakeCamera.instances))

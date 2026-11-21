@@ -17,6 +17,7 @@ from imu_viewer.recalibration import Recalibration
 from imu_viewer.storage import SessionWriter, finalize, export_euroc, read_csv
 from imu_viewer.verify import verify_session
 from test_attitude import frame
+from test_heading_control import diagnostic
 
 
 class LifecycleTests(unittest.TestCase):
@@ -33,13 +34,12 @@ class LifecycleTests(unittest.TestCase):
             state.request()
         state.accept(ControlReply(request+1, 0, 1002000, 2), 11)
         self.assertEqual(state.state, "awaiting_ack")
-        state.accept(ControlReply(request, 1, 1002000, 2), 11)
-        self.assertEqual(state.state, "awaiting_ack")
         state.accept(ControlReply(request, 0, 1002000, 2), 11)
         self.assertEqual(state.state, "calibrating")
         state.accept(frame(1), 12)
         state.accept(frame(2, flags=1024|4096), 12)
         self.assertTrue(state.masked)
+        state.accept(diagnostic(request), 12)
         state.accept(frame(3), 12)
         self.assertEqual(state.state, "completed")
         self.assertFalse(state.masked)
@@ -61,12 +61,14 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(state.state, "waiting_stationary")
         self.assertTrue(state.busy)
         state.accept(frame(101, flags=1024), 47)
+        state.accept(diagnostic(request, timestamp_us=1102000, sequence=102), 48)
         state.accept(frame(102), 48)
         self.assertEqual(state.state, "completed")
 
     def test_disconnect_clears_stale_completed_label_and_does_not_duplicate_event(self):
         state, request = self.pending()
         state.accept(ControlReply(request, 0, 1000000, 0), 11)
+        state.accept(diagnostic(request, timestamp_us=1000000, sequence=0), 12)
         state.accept(frame(), 12)
         self.assertEqual(state.state, "completed")
         state.disconnect()
@@ -158,7 +160,7 @@ class ConnectionTests(unittest.TestCase):
         self.assertTrue(all(connection.history.raw.active[:connection.history.raw.used]["valid"]))
         self.assertTrue(all(f.attitude_valid for f in connection.parser.feed(frame(2).encode())))
         connection._receive_usb(2, frame(3, flags=1024|4096).encode(), 300, 310)
-        connection._receive_usb(3, frame(4).encode(), 400, 410)
+        connection._receive_usb(3, diagnostic(request, timestamp_us=1004000, sequence=4).encode()+frame(4).encode(), 400, 410)
         self.assertEqual(connection.calibration_snapshot()["state"], "completed")
         self.assertTrue(connection.attitude_history.latest.attitude_valid)
         rows = connection.attitude_history.snapshot()[2]

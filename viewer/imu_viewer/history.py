@@ -1,13 +1,15 @@
 """Connection-local waveform history, independent of recording and camera clocks.
 
-Recent samples are exact raw integers. Older data is a per-axis first/min/max/last
-summary on a 30 Hz MCU-time grid, NOT synchronized image samples. Completed chunks
+Recent samples retain source precision (raw integers or attitude floats). Older
+data is a per-axis first/min/max/last summary on a 30 Hz MCU-time grid, NOT
+synchronized image samples. Completed chunks
 are immutable; readers only copy partial chunks under the short history lock.
 """
 from bisect import bisect_left
 from dataclasses import dataclass
 import threading
 import numpy as np
+from .protocol import RAW_IMU_INVALID_FLAGS
 
 RAW = np.dtype([("t", "<u8"), ("v", "<i2", (6,)),
                 ("segment", "<u8"), ("valid", "?")])
@@ -40,7 +42,7 @@ class Chunks:
             if self.used == self.size:
                 self.active.setflags(write=False)
                 self.chunks.append(self.active)
-                key = "t" if self.dtype == RAW else "end"
+                key = "end" if "start" in self.dtype.names else "t"
                 self.ends.append(int(self.active[key][-1]))
                 self.active, self.used = None, 0
 
@@ -51,7 +53,7 @@ class Chunks:
             del self.ends[:n]
 
     def snapshot(self, lo, hi):
-        key = "t" if self.dtype == RAW else "start"
+        key = "start" if "start" in self.dtype.names else "t"
         i = bisect_left(self.ends, lo)
         result = []
         # Do not copy the entire tail of the index for a narrow historical view.
@@ -81,12 +83,25 @@ class HistoryInfo:
 
 
 class WaveformHistory:
-    def __init__(self, recent_s=10, max_bytes=128*1024**2):
+    def __init__(self, recent_s=10, max_bytes=128*1024**2, *,
+                 channels=6, value_dtype="<i2", scales=None):
+        self.channels = channels
+        self.value_dtype = np.dtype(value_dtype)
+        self.raw_dtype = np.dtype([("t", "<u8"), ("v", self.value_dtype, (channels,)),
+                                   ("segment", "<u8"), ("valid", "?")])
+        self.summary_dtype = np.dtype([("start", "<u8"), ("end", "<u8"),
+                                       ("t", "<u8", (4, channels)),
+                                       ("v", self.value_dtype, (4, channels)),
+                                       ("segment", "<u8")])
+        self.scales = np.asarray(scales if scales is not None else
+                                 [24/32768]*3 + [2000/32768]*3, dtype=float)
+        if self.scales.shape != (channels,):
+            raise ValueError("Each waveform channel needs one display scale")
         self.lock = threading.RLock()
         self.recent_us = int(recent_s*1e6)
         self.max_bytes = max_bytes
-        self.raw = Chunks(RAW, 1024)
-        self.summary = Chunks(SUMMARY, 256)
+        self.raw = Chunks(self.raw_dtype, 1024)
+        self.summary = Chunks(self.summary_dtype, 256)
         self.current = None
         self.current_bucket = None
         self.origin = self.latest = self.last_sequence = None
@@ -96,7 +111,7 @@ class WaveformHistory:
         self.summary_end = None
         self.warning = None
         # A fixed recent-buffer reserve bounds pathological rates as well.
-        self.raw_reserve = min(4*1024**2, max(2*1024*RAW.itemsize, max_bytes//4))
+        self.raw_reserve = min(4*1024**2, max(2*1024*self.raw_dtype.itemsize, max_bytes//4))
         self.raw_warning = None
 
     def append_frames(self, frames):
@@ -119,7 +134,7 @@ class WaveformHistory:
 
     def _allocated(self):
         # Include conservative per-chunk Python/index overhead and active summary.
-        return (self.raw.allocated + self.summary.allocated + SUMMARY.itemsize
+        return (self.raw.allocated + self.summary.allocated + self.summary_dtype.itemsize
                 + (len(self.raw.chunks)+len(self.summary.chunks)+4)*512)
 
     def _freeze(self, text):
@@ -129,23 +144,30 @@ class WaveformHistory:
     def _commit(self):
         if self.current is None or self.warning:
             return
-        extra = self.summary.size*SUMMARY.itemsize if self.summary.active is None else 0
+        extra = self.summary.size*self.summary_dtype.itemsize if self.summary.active is None else 0
         if self._allocated()+extra+self.raw_reserve > self.max_bytes:
             self._freeze("波形历史达到内存安全上限")
             return
-        self.summary.append(np.array([self.current], dtype=SUMMARY))
+        self.summary.append(np.array([self.current], dtype=self.summary_dtype))
         self.current = None
 
-    def append_arrays(self, times, values, sequences, flags=None, invalid_source=None):
+    def append_arrays(self, times, values, sequences, flags=None, invalid_source=None,
+                      *, validity=None, discontinuity=None):
         """Batch API shared by acquisition and deterministic performance fixtures."""
         times = np.asarray(times, dtype=np.uint64)
         n = len(times)
         if not n:
             return
-        values = np.asarray(values, dtype=np.int16).reshape(n, 6)
+        values = np.asarray(values, dtype=self.value_dtype).reshape(n, self.channels)
         sequences = np.asarray(sequences, dtype=np.uint32)
         flags = np.zeros(n, np.uint16) if flags is None else np.asarray(flags, np.uint16)
         invalid_source = np.zeros(n, bool) if invalid_source is None else np.asarray(invalid_source, bool)
+        # Attitude uses its own protocol validity, not raw-six-axis quality bits.
+        valid = (((flags & RAW_IMU_INVALID_FLAGS) == 0) & ~invalid_source if validity is None
+                 else np.asarray(validity, dtype=bool))
+        valid = valid & np.isfinite(values).all(axis=1)
+        discontinuity = (np.zeros(n, bool) if discontinuity is None
+                         else np.asarray(discontinuity, dtype=bool))
         with self.lock:
             # Do not fabricate a monotonic axis after reset/duplicates.
             bad = np.flatnonzero(times[1:] <= times[:-1]) + 1
@@ -155,27 +177,25 @@ class WaveformHistory:
             if timeline_bad:
                 n = int(bad[0])
                 times, values, sequences = times[:n], values[:n], sequences[:n]
-                flags, invalid_source = flags[:n], invalid_source[:n]
+                flags, valid, discontinuity = flags[:n], valid[:n], discontinuity[:n]
             if not n:
                 self._freeze("H743 时间戳异常")
                 self.last_valid = False
                 return
             if self.origin is None:
                 self.origin = int(times[0])
-            # Attitude/calibration bits must not suppress raw six-axis measurements.
-            valid = ((flags & 0xE3EE) == 0) & ~invalid_source
             steps = (sequences.astype(np.uint64) - np.r_[
                 np.uint64(self.last_sequence if self.last_sequence is not None else (int(sequences[0])-1)&0xFFFFFFFF),
                 sequences[:-1].astype(np.uint64)]) & np.uint64(0xFFFFFFFF)
-            breaks = (steps != 1) | ~valid | ~np.r_[self.last_valid, valid[:-1]] | ((flags & 16) != 0)
+            breaks = (steps != 1) | ~valid | ~np.r_[self.last_valid, valid[:-1]] | ((flags & 16) != 0) | discontinuity
             segments = self.segment + np.cumsum(breaks, dtype=np.uint64)
-            rows = np.empty(n, RAW)
+            rows = np.empty(n, self.raw_dtype)
             rows["t"], rows["v"], rows["valid"], rows["segment"] = times, values, valid, segments
             # Append in bounded portions so even an unusually large input batch is bounded.
             for offset in range(0, n, 1024):
                 part = rows[offset:offset+1024]
                 self.raw.prune(int(part["t"][-1])-self.recent_us)
-                while self.raw.chunks and self.raw.allocated+1024*RAW.itemsize > self.raw_reserve:
+                while self.raw.chunks and self.raw.allocated+1024*self.raw_dtype.itemsize > self.raw_reserve:
                     del self.raw.chunks[0]
                     del self.raw.ends[0]
                     self.raw_warning = "输入速率过高：最近完整样本窗口不足 10 秒"
@@ -202,10 +222,10 @@ class WaveformHistory:
                             break
                         v = values[a:b]
                         mins, maxs = v.argmin(axis=0)+a, v.argmax(axis=0)+a
-                        ix = np.stack((np.full(6, a), mins, maxs, np.full(6, b-1)))
-                        ts, vs = times[ix], values[ix, np.arange(6)]
+                        ix = np.stack((np.full(self.channels, a), mins, maxs, np.full(self.channels, b-1)))
+                        ts, vs = times[ix], values[ix, np.arange(self.channels)]
                         if self.current is None:
-                            self.current = np.zeros((), SUMMARY)
+                            self.current = np.zeros((), self.summary_dtype)
                             self.current["start"], self.current["segment"] = times[a], segment
                             self.current["t"], self.current["v"] = ts, vs
                             self.current_bucket = bucket
@@ -240,7 +260,7 @@ class WaveformHistory:
             lo, hi = self.origin+int(lo_s*1e6), self.origin+int(hi_s*1e6)
             summaries = self.summary.snapshot(lo, hi)
             if self.current is not None and int(self.current["end"]) >= lo and int(self.current["start"]) <= hi:
-                summaries.append(np.array([self.current], dtype=SUMMARY))
+                summaries.append(np.array([self.current], dtype=self.summary_dtype))
             raw = self.raw.snapshot(lo, hi)
             return info, summaries, raw
 
@@ -280,14 +300,14 @@ def render_history(history, lo_s, hi_s, pixels=1000):
     """CPU work for the renderer thread, never performed under acquisition locks."""
     info, summaries, raw = history.snapshot(lo_s, hi_s)
     if info.origin_us is None:
-        return info, [(np.empty(0), np.empty(0)) for _ in range(6)]
-    summary = np.concatenate(summaries) if summaries else np.empty(0, SUMMARY)
-    exact = np.concatenate(raw) if raw else np.empty(0, RAW)
+        return info, [(np.empty(0), np.empty(0)) for _ in range(history.channels)]
+    summary = np.concatenate(summaries) if summaries else np.empty(0, history.summary_dtype)
+    exact = np.concatenate(raw) if raw else np.empty(0, history.raw_dtype)
     cutoff = info.raw_start_us if info.raw_start_us is not None else info.latest_us+1
     summary = summary[summary["start"] < cutoff]
     exact = exact[(exact["t"] >= cutoff) & exact["valid"]]
     series = []
-    for axis in range(6):
+    for axis in range(history.channels):
         ts = summary["t"][:, :, axis]
         vs = summary["v"][:, :, axis]
         order = np.argsort(ts, axis=1, kind="stable")
@@ -306,5 +326,5 @@ def render_history(history, lo_s, hi_s, pixels=1000):
         # Subtract integer origin BEFORE float conversion.
         relative = (t.astype(np.int64)-info.origin_us)/1e6
         x, y = envelope(relative, v, seg, lo_s, hi_s, pixels)
-        series.append((x, y*(24/32768 if axis < 3 else 2000/32768)))
+        series.append((x, y*history.scales[axis]))
     return info, series

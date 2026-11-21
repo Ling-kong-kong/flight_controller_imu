@@ -519,7 +519,7 @@ class LiveConnection(Recorder):
             self.recalibration.accept(record)
             if isinstance(record, Frame):
                 display.append(replace(record, flags=record.flags & ~2048)
-                               if self.recalibration.masked else record)
+                               if (self.recalibration.consume_break() or self.recalibration.masked) else record)
         self.attitude_history.append_frames(display)
         self._calibration_events()
 
@@ -530,10 +530,16 @@ class LiveConnection(Recorder):
                 sink.enqueue(sink.usb_q, ("event", "imu_recalibration", event))
 
     def request_recalibration(self):
+        return self._request_control(1)
+
+    def request_heading_zero(self):
+        return self._request_control(2)
+
+    def _request_control(self, operation):
         with self.routing_lock:
             if self.stop_event.is_set() or not self.metrics["imu_frames"]:
                 raise RuntimeError("Wait for live IMU data")
-            request_id = self.recalibration.request()
+            request_id = self.recalibration.request(operation)
             self._calibration_events()
             return request_id
 

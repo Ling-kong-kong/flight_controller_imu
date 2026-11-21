@@ -2,7 +2,7 @@
 
 独立的裸机 C 工程，默认从 **Flash `0x08000000`** 启动，用 ST-Link/SWD 直接烧录，不需要飞控固件或 bootloader。芯片、晶振、SPI、USB、电源引脚取自 [原始板级配置](docs/original-hwdef.dat)。
 
-**当前版本每秒输出 1000 帧，每帧包含原始六轴、共同时间戳、四元数及 roll/pitch/yaw。** STM32H743 在主循环运行六轴 Mahony 姿态融合；USB 未连接时也持续更新，重连不重置姿态。BMM150 仅独立诊断采集、不参与姿态融合，yaw 是静置校准归零、允许漂移的相对航向，不是磁航向或真北。加热器始终关闭。
+**当前版本每秒输出 1000 帧，每帧包含原始六轴、共同时间戳、四元数及 roll/pitch/yaw。** STM32H743 在主循环运行六轴 Mahony 姿态融合；USB 未连接时也持续更新，重连不重置姿态。默认开启 **BMM150 实验性磁门控与相对 yaw 辅助**：静置校准归零，合格磁场抑制漂移，磁场拒绝时退回六轴；不是磁北/真北，不能保证消除漂移。加热器始终关闭。
 
 > 融合安装旋转沿用历史 `ROTATION_PITCH_180`（X/Z 取反），原始六轴不变；历史配置不等于实板方向已核验，完整实板验收仍未完成。历史 `release/`、`docs/validation.json` 和 `release/BUILD_INFO.json` 不代表本次姿态功能的交付或验收结果。
 
@@ -10,7 +10,7 @@
 |---|---|
 | MCU / 晶振 | STM32H743，2 MB Flash，16 MHz HSE 晶体，LDO |
 | 时钟 | CPU 400 MHz，AHB 200 MHz，APB 100 MHz |
-| USB 输出 | **固定 1000 Hz 六轴/姿态组合帧**，76 字节/帧，76000 B/s |
+| USB 输出 | **固定 1000 Hz 六轴/姿态组合帧**，76 字节/帧，76000 B/s；另加约 1800 B/s 磁帧 |
 | 输出时间戳 | 同一个 TIM2 微秒时基上的绝对网格，`t0+n×1000 μs` |
 | 加速度内部采样 | 1600 Hz，±24 g，Normal 滤波，XY 280 / Z 245 Hz 带宽 |
 | 陀螺仪内部采样 | 2000 Hz，±2000 °/s，230 Hz 带宽 |
@@ -19,9 +19,13 @@
 
 ## BMM150 通信与磁场采集
 
-新增 BMM150 独立采集：I²C4 PF14/PF15、7 位地址 `0x10`，核对 Chip ID `0x32`、读取工厂 trim 并补偿为 µT，正常模式约 25 Hz。磁场以独立 **72 字节 IMU2 v1/type 4** 帧与原有 76 字节 IMU 帧混合发送，不改六轴/姿态定义。磁场保留芯片轴，未应用安装旋转，**不做硬/软铁标定，也不纠正 yaw**。
+新增 BMM150 独立采集：I²C4 PF14/PF15、7 位地址 `0x10`，核对 Chip ID `0x32`、读取工厂 trim 并补偿为 µT，正常模式约 25 Hz。磁场以独立 **72 字节 IMU2 v1/type 4** 帧与原有 76 字节 IMU 帧混合发送，不改六轴/姿态定义。磁场保留芯片轴，未应用安装旋转，**原始磁帧不做环境硬/软铁修正**；内部磁辅助另使用固化候选标定和独立安装旋转，不改变原始输出。采用四元数世界磁向量比较及限速世界 Z 修正，不依赖 Euler pitch；竖直附近的 Euler 显示奇异性仍存在。算法、门限、状态与关闭方式见 **[磁门控与相对 yaw 融合](docs/bmm150-fusion.md)**。
 
 操作、协议和验收边界见 **[BMM150 通信与磁场采集指南](docs/bmm150-validation.md)**。专用 `tools/mag_capture.py` 可采集和回放磁场 CSV，并同时统计原有 1 kHz IMU 链路；当前 GUI 只识别并跳过磁帧，不显示磁场。源代码和软件测试就绪不代表已经烧录或通过实板验收；实测文件仅存本地。
+
+离线硬铁/软铁**候选**拟合工具 `tools/mag_calibrate.py` 的安装、全方向采集、拟合方法和独立复测步骤见 **[BMM150 离线磁标定说明](docs/bmm150-calibration.md)**。候选通过不等于实板验收通过；离线工具自身不下发参数或改变 yaw，固件内部融合是独立路径。
+
+已选择保留的硬/软铁数值成果见 **[BMM150 集成候选配置](config/bmm150-calibration-candidate.json)**，JSON 是候选选择时的历史快照，不是运行时加载文件；其偏置、矩阵和参考模长已固化到 firmware/include/mag_calibration.h。磁安装旋转暂用 diag(-1,-1,+1)，完整磁轴/倾斜补偿/动态精度验收仍未完成，不修改候选快照的 false/null 字段冒充验收。验收顺序见 [集成与验收顺序](docs/bmm150-calibration.md#5-集成与验收顺序)。采集数据与验收报告仍仅存本地。
 
 ## 时间同步的范围
 
@@ -53,6 +57,8 @@
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
+
+全新构建默认 ENABLE_EXPERIMENTAL_MAG_FUSION=ON；旧 CMake 缓存可能保留 OFF，必须核对缓存与编译宏。纯六轴对照显式使用 `-DENABLE_EXPERIMENTAL_MAG_FUSION=OFF`，详见 [融合说明](docs/bmm150-fusion.md)。
 
 生成 `build/imu_firmware.elf`、`.bin`、`.hex`、`.map`。HEX 自带地址；BIN 的烧录地址是 **`0x08000000`**。`release/` 为历史预编译文件，**尚未更新为本次 v3**，不可误用。完成测试及相应实板验收后可执行 `python3 scripts/package_release.py` 更新固件、校验和及完整工程 ZIP。
 
@@ -160,7 +166,7 @@ USB 关闭、卸载或挂起只清空发送队列、重建发送会话与序号�
 
 - 当前角速度模长 <5 °/s，加速度模长距 1 g ≤0.1 g。
 - 200 ms 窗口内原始加速度各轴标准差 ≤0.02 g，30 Hz 检测专用低通后的角速度各轴标准差 ≤0.5 °/s；该低通仅用于静置判断，不改变原始输出、零偏均值或姿态积分。
-- Mahony `Kp=2 s⁻¹`、`Ki=0`；加速度模长或短时波动不适合重力修正时，仅积分陀螺。
+- Mahony `Kp=2 s⁻¹`、`Ki=0`；运行时加速度修正保留数据新鲜、无错误及 0.9～1.1 g 模长保护，但不再要求 200 ms 各轴加速度静稳。启动静置判据不变；模长合格仍可能含线性加速度，运动时需实板验证。
 
 这些是首版固定参数，阈值可靠性、实板安装方向及运行开销尚需验收。安装旋转只在 `firmware/include/fusion.h` 独立配置，不能改动原始轴定义来迁就姿态。
 
@@ -180,8 +186,10 @@ python3 -m unittest discover -s tests -v
 - `firmware/src/bmi088.c`：初始化、配置回读和原始数据读取。
 - `firmware/src/board_i2c.c` / `mag.c`：非阻塞 I²C4、BMM150 配置/回读、工厂补偿及独立磁场诊断。
 - `tools/mag_capture.py`：混合流磁场采集、CSV、统计与离线回放。
+- `tools/mag_calibrate.py`：NumPy 离线硬/软铁候选拟合、覆盖和模长残差检查，不写硬件。
 - `firmware/src/stream.c`：历史选样、快照队列、主循环融合调度、质量标志、发送队列、手动重校准命令及 USB 会话。
 - `firmware/src/fusion.c`：静置校准、独立安装旋转、六轴 Mahony、四元数/Euler 与失效重置。
+- `firmware/src/mag_heading.c`：候选磁修正、异常/时效门控、四元数世界磁投影、固定相对参考与限速世界 Z 辅助。
 - `firmware/src/protocol.c`：二进制帧及 CRC。
 - `tools/imu_capture.py`：主机采集、v2/v3 解码、CSV、输出和对齐统计。
 - `viewer/`：双目/IMU 实时预览、姿态与有界趋势、录制四元数详情、离线校验与 EuRoC 导出，见 [上位机说明](viewer/README.md)。

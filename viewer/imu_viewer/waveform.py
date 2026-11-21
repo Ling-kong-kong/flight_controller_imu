@@ -54,7 +54,7 @@ class WaveViewBox(pg.ViewBox):
 
 
 class Chart(QtWidgets.QWidget):
-    def __init__(self, title, unit, columns):
+    def __init__(self, title, unit, columns, names=("X", "Y", "Z")):
         super().__init__()
         self.title, self.unit, self.columns = title, unit, columns
         self.fixed_y = False
@@ -69,7 +69,7 @@ class Chart(QtWidgets.QWidget):
         self.plot.hideButtons()
         self.curves = [self.plot.plot(pen=pg.mkPen(color, width=1.2), name=axis,
                                       connect="finite", skipFiniteCheck=False)
-                       for axis, color in zip("XYZ", ("#ff737e", "#59dfba", "#6db6ff"))]
+                       for axis, color in zip(names, ("#ff737e", "#59dfba", "#6db6ff", "#edc66b"))]
         self.view.setXRange(0, 10, padding=0)
         self.view.setAutoVisible(y=True)
         self.view.enableAutoRange(y=True)
@@ -149,7 +149,7 @@ class YRangeDialog(QtWidgets.QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         for chart in deck.charts:
-            group = QtWidgets.QGroupBox(f"{chart.title}（{chart.unit}）")
+            group = QtWidgets.QGroupBox(f"{chart.title}（{chart.unit or '无量纲'}）")
             form = QtWidgets.QFormLayout(group)
             fixed = QtWidgets.QCheckBox("固定纵轴（实时／历史均保留）")
             low, high = QtWidgets.QDoubleSpinBox(), QtWidgets.QDoubleSpinBox()
@@ -239,9 +239,10 @@ class ExpandedChart(QtWidgets.QMainWindow):
 class WaveformPanel(QtWidgets.QWidget):
     time_span_changed = QtCore.Signal(float)
 
-    def __init__(self):
+    def __init__(self, chart_specs=None):
         super().__init__()
         self.history = None
+        self.stopped = False
         self.generation = self.version = 0
         self.follow = True
         self.time_span = 10.0
@@ -253,12 +254,19 @@ class WaveformPanel(QtWidgets.QWidget):
         self.worker = RenderWorker()
         self.worker.result.connect(self.rendered)
         self.last_error = None
-        self.accel_chart = Chart("加速度", "g", (1, 2, 3))
-        self.gyro_chart = Chart("角速度", "°/s", (4, 5, 6))
-        self.charts = (self.accel_chart, self.gyro_chart)
+        default_charts = chart_specs is None
+        if default_charts:
+            chart_specs = (("加速度", "g", (1, 2, 3)), ("角速度", "°/s", (4, 5, 6)))
+        self.charts = tuple(Chart(*spec) for spec in chart_specs)
+        self.primary_chart = self.charts[0]
+        self.channel_count = max(column for chart in self.charts for column in chart.columns)
+        # Backward-compatible names for the default raw-six-axis panel.
+        if default_charts:
+            self.accel_chart, self.gyro_chart = self.charts
         self.places = {}
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         controls = QtWidgets.QHBoxLayout()
         for text, callback in (("回到实时", self.live), ("查看全程", self.all_history),
                                ("纵轴自动", self.auto_y), ("纵轴范围…", self.show_ranges)):
@@ -289,7 +297,7 @@ class WaveformPanel(QtWidgets.QWidget):
         layout.addWidget(split, 1)
         self.state = QtWidgets.QLabel("等待 IMU 数据；波形历史不等于录制文件")
         self.state.setWordWrap(True)
-        self.state.setToolTip("早期历史仅保留各轴独立峰值，不能恢复原始细节，也不是同一时刻的六轴样本；波形历史不等于录制文件。")
+        self.state.setToolTip("早期历史仅保留各轴独立峰值，不能恢复原始细节，也不代表同一时刻的多分量样本或有效四元数；波形历史不等于录制文件。")
         self.state.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.state)
         self.timer = QtCore.QTimer(self)
@@ -335,7 +343,7 @@ class WaveformPanel(QtWidgets.QWidget):
         self.version += 1
         self.last_request = None
         if not self.follow:
-            lo, hi = self.accel_chart.view.viewRange()[0]
+            lo, hi = self.primary_chart.view.viewRange()[0]
             center = (lo+hi)/2
             self.set_range(center-seconds/2, center+seconds/2)
         elif self.history is None or self.history.info().origin_us is None:
@@ -355,7 +363,7 @@ class WaveformPanel(QtWidgets.QWidget):
         self.last_request = None
         self.last_error = None
         self.follow = True
-        empty = [(np.empty(0), np.empty(0)) for _ in range(6)]
+        empty = [(np.empty(0), np.empty(0)) for _ in range(self.channel_count)]
         for chart in self.charts:
             chart.set_series(empty)
         self.set_range(0, self.time_span)
@@ -368,7 +376,7 @@ class WaveformPanel(QtWidgets.QWidget):
         self.last_request = None
 
     def range_changed(self, chart, value):
-        if self.changing:
+        if self.stopped or self.changing:
             return
         # This path also handles programmatic range changes in tests. Explicit
         # mouse/wheel handlers own the transition out of live-follow mode.
@@ -408,7 +416,7 @@ class WaveformPanel(QtWidgets.QWidget):
         # Validate everything before applying: a bad second range must not
         # partially change the first chart. None requests visible-data auto Y.
         if len(ranges) != len(self.charts):
-            raise ValueError("需要分别提供加速度和角速度范围")
+            raise ValueError("需要分别提供各波形图的纵轴范围")
         for bounds in ranges:
             if bounds is not None and (len(bounds) != 2 or
                     not all(np.isfinite(v) for v in bounds) or bounds[0] >= bounds[1]):
@@ -422,17 +430,17 @@ class WaveformPanel(QtWidgets.QWidget):
             chart.update_y_mode()
 
     def auto_y(self):
-        self.set_y_ranges([None, None])
+        self.set_y_ranges([None] * len(self.charts))
 
     def refresh(self):
-        if self.history is None:
+        if self.stopped or self.history is None:
             return
         info = self.history.info()
         if info.origin_us is None:
             return
         if self.follow:
             self.set_range(max(0, info.duration-self.time_span), max(self.time_span, info.duration))
-        lo, hi = self.accel_chart.view.viewRange()[0]
+        lo, hi = self.primary_chart.view.viewRange()[0]
         exact_start = (info.raw_start_us-info.origin_us)/1e6 if info.raw_start_us is not None else info.duration
         fidelity = "完整样本" if lo >= exact_start else "分段峰值（早期细节不可恢复）" + (" + 最近完整样本" if hi >= exact_start else "")
         warning = ""
@@ -461,6 +469,8 @@ class WaveformPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def rendered(self, result):
+        if self.stopped:
+            return
         generation, version, info, series, error = result
         if generation != self.generation or version != self.version:
             return  # Result from old connection or navigation, never overwrite new view.
@@ -495,9 +505,22 @@ class WaveformPanel(QtWidgets.QWidget):
         window.deleteLater()
 
     def shutdown(self):
+        if self.stopped:
+            return
+        self.stopped = True
         self.timer.stop()
         if self.range_dialog is not None:
             self.range_dialog.close()
+            self.range_dialog.deleteLater()
         for window in list(self.expanded.values()):
             window.close()
         self.worker.shutdown()
+        # Explicit GUI-thread destruction: pyqtgraph contains Python reference
+        # cycles. Leaving graphs to GC can destroy their Qt scene/widgets on an
+        # acquisition/writer thread, even long after this window was closed.
+        for chart in self.charts:
+            chart.deleteLater()
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)

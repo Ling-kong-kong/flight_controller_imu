@@ -1,10 +1,11 @@
-"""Automatic recording/export workflow, without hardware."""
+"""Save-only workflow: complete IMU-led associations without conversion or hardware."""
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import csv
 import io
+import json
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,296 +13,237 @@ from unittest.mock import patch, Mock
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from imu_viewer.capture import Config
-from imu_viewer.protocol import Frame
+from imu_viewer.protocol import Frame, ATTITUDE_FIELDS
 from imu_viewer.storage import SessionWriter, finalize, read_csv
-from imu_viewer.workflow import validate_output_root, resolve_raw_session, next_export_destination, export_recording
+from imu_viewer.workflow import validate_output_root, resolve_raw_session
 from imu_viewer.gui import Window
 from imu_viewer.__main__ import main
 
 
-class WorkflowTests(unittest.TestCase):
+class SavedAssociationTests(unittest.TestCase):
     def setUp(self):
         parent = Path(__file__).resolve().parents[1]/"test-results"
         parent.mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(dir=parent)
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        temp = tempfile.TemporaryDirectory(dir=parent)
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
 
-    def session(self, finalized=True):
-        path = self.root/"recordings"/"session_test"/"raw"
+    def session(self, images=True, count=10):
+        path = self.root/"session_test"/"raw"
         writer = SessionWriter(path, Config(port="FAKE", width=8, height=4))
-        image = np.zeros((4,8,3), np.uint8)
-        for i in range(10):
-            frame = Frame(i, 1000000+i*1000, 1,2,3,4,5,6,20,10,16 if i==0 else 0)
-            host = 5000000000+i*1000000
+        for i in range(count):
+            valid = i % 3 == 0
+            frame = Frame(i, 1000000+i*1000, -i, 2, 3, 4, 5, i, 20, 10,
+                          flags=2048 if valid else 0, protocol_version=3 if i % 3 != 2 else 2,
+                          qw=1, qx=0, qy=0, qz=0, roll_deg=1, pitch_deg=2, yaw_deg=3)
+            host = 5_000_000_000+i*1_000_000
             writer.usb(i, frame.encode(), host-10000, host, [frame])
-            if i in (0,9):
-                writer.image(i//9, float(i), i*1000000, host-100000, host, image)
+            if images and i in (0, 9):
+                writer.image(i//9, float(i), i*1_000_000, host-100000, host,
+                             np.zeros((4, 8, 3), np.uint8))
+        if images:
+            writer.image(2, 100., 100_000_000, 5_100_000_000, 5_100_010_000,
+                         np.zeros((4, 8, 3), np.uint8))
         writer.close()
-        if finalized:
-            finalize(path, dict(error=None, timeline_anomaly=False))
         return path
 
+    def test_save_all_rows_attitude_blanks_and_original_images(self):
+        path = self.session()
+        originals = {p.relative_to(path):p.read_bytes() for p in path.rglob("*")
+                     if p.is_file() and p.name != "session.json"}
+        with patch("imu_viewer.storage.write_png", side_effect=AssertionError("no re-encoding")), \
+             patch("imu_viewer.storage.cv2.imdecode", side_effect=AssertionError("no image reads")), \
+             patch("imu_viewer.storage.export_euroc", side_effect=AssertionError("no export")):
+            finalize(path, dict(error=None))
+        rows = list(read_csv(path/"imu_image.csv"))
+        raw = list(read_csv(path/"imu.csv"))
+        self.assertEqual(len(rows), 10)
+        for a, b in zip(rows, raw):
+            self.assertEqual({k:a[k] for k in b}, b)
+            if b["attitude_valid"] == "0":
+                self.assertTrue(all(a[k] == "" for k in ATTITUDE_FIELDS))
+        self.assertEqual([r["image_frame_id"] for r in rows], ["0"]+[""]*8+["1"])
+        self.assertEqual(rows[3]["qw"], "1")  # valid attitude without image
+        self.assertEqual(rows[3]["cam0"], "")
+        for row in (rows[0], rows[9]):
+            self.assertEqual(row["image_minus_imu_ns"], "0")
+            self.assertTrue((path/row["cam0"]).is_file())
+            self.assertTrue((path/row["cam1"]).is_file())
+        self.assertEqual(originals, {k:(path/k).read_bytes() for k in originals})
+        metadata = json.loads((path/"association.json").read_text(encoding="utf8"))
+        self.assertEqual([metadata[k] for k in ("imu_rows", "matched_imu_rows", "unmatched_imu_rows",
+                                                "image_frames", "unmatched_image_frames")], [10,2,8,3,1])
+        self.assertEqual(metadata["match_tolerance_ns"], 20_000_000)
+        self.assertFalse((path.parent/"export").exists())
+        self.assertTrue((path/"cam0/000000002.png").is_file())  # unmatched image retained
+        self.assertTrue(json.loads((path/"session.json").read_text(encoding="utf8"))["finalized"])
+        before = (path/"imu_image.csv").read_bytes()
+        finalize(path)
+        self.assertEqual((path/"imu_image.csv").read_bytes(), before)
+
+    def test_no_images_keeps_all_imu(self):
+        path = self.session(images=False)
+        finalize(path, dict(error=None))
+        rows = list(read_csv(path/"imu_image.csv"))
+        self.assertEqual(len(rows), 10)
+        self.assertTrue(all(r[k] == "" for r in rows for k in
+                            ("image_frame_id","image_timestamp_ns","image_minus_imu_ns","cam0","cam1")))
+
+    def test_no_imu_has_header_and_retains_images(self):
+        path = self.session(count=0)
+        finalize(path, dict(error=None))
+        self.assertEqual(list(read_csv(path/"imu_image.csv")), [])
+        with (path/"imu_image.csv").open(newline="", encoding="utf8") as f:
+            self.assertIn("yaw_deg", next(csv.reader(f)))
+        self.assertTrue((path/"cam1/000000002.png").is_file())
+
+    def test_atomic_failure_is_not_finalized_and_does_not_replace_table(self):
+        path = self.session()
+        finalize(path, dict(error=None))
+        old = (path/"imu_image.csv").read_bytes()
+        replace = Path.replace
+        def fail_table(source, target):
+            if Path(target).name == "imu_image.csv":
+                raise OSError("disk full saving associations")
+            return replace(source, target)
+        with patch.object(Path, "replace", fail_table), self.assertRaisesRegex(OSError,"disk full"):
+            finalize(path)
+        self.assertFalse(json.loads((path/"session.json").read_text(encoding="utf8"))["finalized"])
+        self.assertEqual((path/"imu_image.csv").read_bytes(), old)
+        self.assertTrue((path/"usb.bin").is_file())
+        finalize(path)
+        self.assertTrue(json.loads((path/"session.json").read_text(encoding="utf8"))["finalized"])
+
     def test_single_root_and_container_resolution(self):
-        root = validate_output_root(self.root/"a"/".."/"recordings")
-        self.assertEqual(root, self.root/"recordings")
+        self.assertEqual(validate_output_root(self.root/"a"/".."), self.root)
         with self.assertRaises(ValueError):
             validate_output_root(" ")
         source = self.session()
         self.assertEqual(resolve_raw_session(source.parent), source)
         self.assertEqual(resolve_raw_session(source), source)
-        self.assertEqual(next_export_destination(source.parent), source.parent/"export")
-
-    def test_legacy_export_stays_outside_raw_source(self):
-        legacy = self.root/"session_old"
-        self.assertEqual(resolve_raw_session(legacy), legacy)
-        self.assertEqual(next_export_destination(legacy), self.root/"session_old_euroc")
-
-    def test_unique_destination_keeps_completed_and_incomplete(self):
-        source = self.root/"recordings"/"session_test"/"raw"
-        exports = source.parent
-        base = next_export_destination(source)
-        base.mkdir(parents=True)
-        (base/"export.json").write_text("original")
-        incomplete = exports/(base.name+"_001")
-        incomplete.mkdir()
-        (incomplete/"EXPORT_INCOMPLETE").touch()
-        self.assertEqual(next_export_destination(source).name, base.name+"_002")
-        self.assertEqual((base/"export.json").read_text(), "original")
-        self.assertTrue((incomplete/"EXPORT_INCOMPLETE").exists())
-
-    def test_export_preserves_raw_and_all_imu_rows(self):
-        source = self.session()
-        before = {p.relative_to(source):p.read_bytes() for p in source.rglob("*") if p.is_file()}
-        result = export_recording(source)
-        destination = Path(result["destination"])
-        self.assertEqual(result["imu_frames"],10)
-        self.assertEqual(len(list(read_csv(destination/"imu_image.csv"))),10)
-        self.assertEqual(result["source"],str(source))
-        self.assertEqual(destination.parent,source.parent)
-        self.assertFalse((destination/"EXPORT_INCOMPLETE").exists())
-        self.assertEqual(before, {p.relative_to(source):p.read_bytes() for p in source.rglob("*") if p.is_file()})
-        second = export_recording(source)
-        self.assertEqual(Path(second["destination"]).name, destination.name+"_001")
-
-    def test_unfinalized_is_not_exported_as_success(self):
-        source = self.session(False)
-        with self.assertRaisesRegex(RuntimeError, "导出失败"):
-            export_recording(source)
-        self.assertTrue((source/"usb.bin").exists())
-        self.assertFalse(any(source.parent.rglob("export.json")))
-
-    def test_conversion_failure_keeps_raw_and_incomplete_marker(self):
-        source = self.session()
-        raw = (source/"usb.bin").read_bytes()
-        with patch("imu_viewer.storage.write_png", side_effect=OSError("disk error")):
-            with self.assertRaisesRegex(RuntimeError, "重新导出"):
-                export_recording(source)
-        self.assertEqual((source/"usb.bin").read_bytes(),raw)
-        target = source.parent/"export"
-        self.assertTrue((target/"EXPORT_INCOMPLETE").exists())
-        self.assertNotEqual(next_export_destination(source),target)
 
 
-class AutoExportGuiTests(unittest.TestCase):
+class SaveGuiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        # Windows offscreen starts without fonts; load one before constructing plots.
         font = Path("C:/Windows/Fonts/msyh.ttc")
         if font.exists():
             QtGui.QFontDatabase.addApplicationFont(str(font))
             cls.app.setFont(QtGui.QFont("Microsoft YaHei", 9))
 
     def window(self):
-        with patch.object(Window,"refresh_devices"):
+        with patch.object(Window, "refresh_devices"):
             window = Window()
-        self.addCleanup(window.close)
+        window.timer.stop()
+        def cleanup():
+            window.recorder = window.connection = None
+            window.close()
+            window.deleteLater()
+            QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        self.addCleanup(cleanup)
+        window.show()
         return window
 
-    def pump_until(self, predicate):
-        deadline = time.perf_counter()+5
-        while not predicate() and time.perf_counter()<deadline:
-            self.app.processEvents()
-            time.sleep(.01)
-        self.assertTrue(predicate())
-
-    def test_finalize_once_after_done_even_disconnected_and_close_waits(self):
+    def test_save_popup_waits_then_closes_once_without_export_job(self):
         window = self.window()
-        window.show()
-        done, entered, release = threading.Event(), threading.Event(), threading.Event()
-        source = Path(__file__).resolve().parent/"synthetic_session"/"raw"
-        destination = source.parent/"export"
-        sink = SimpleNamespace(done=done, path=source, error=None, report={})
+        done = threading.Event()
+        sink = SimpleNamespace(done=done, path=Path("session/raw"), error=None, report={})
         window.recorder = sink
-        def export(source_arg):
-            self.assertTrue(done.is_set())
-            self.assertEqual(source_arg, source)
-            entered.set()
-            if not release.wait(5):
-                raise RuntimeError("test timed out")
-            return dict(source=str(source),destination=str(destination))
-        with patch("imu_viewer.gui.export_recording",side_effect=export) as exporter:
-            try:
-                window.tick()
-                exporter.assert_not_called()
-                done.set()
-                window.tick()
-                self.pump_until(entered.is_set)
-                self.assertTrue(window.busy)
-                self.assertFalse(window.output.isEnabled())
-                self.assertFalse(window.start_button.isEnabled())
-                for _ in range(5):
-                    window.tick()
-                self.assertEqual(exporter.call_count,1)
-                window.close()
-                self.assertTrue(window.isVisible())
-                self.assertTrue(window.closing)
-                release.set()
-                self.pump_until(lambda:not window.isVisible())
-                self.assertFalse(window.busy)
-                self.assertEqual(window.last_export,destination)
-            finally:
-                release.set()
-                self.pump_until(lambda:not window.busy)
-
-    def test_finish_button_shows_saving_then_export_and_auto_closes(self):
-        window = self.window()
-        window.timer.stop()
-        window.show()
-        self.assertEqual(window.stop_button.text(), "完成录制")
-        done, entered, release = threading.Event(), threading.Event(), threading.Event()
-        source = Path("session/raw").resolve()
-        stop = Mock()
-        window.connection = SimpleNamespace(stop_recording=stop)
-        window.recorder = SimpleNamespace(done=done, path=source, error=None, report={})
-        with patch.object(window, "set_recording_controls"):
-            window.stop_recording()
-            stop.assert_called_once()
-        dialog = window.export_dialog
-        finished = []
-        dialog.finished.connect(finished.append)
-        self.assertTrue(dialog.isVisible())
-        self.assertFalse(dialog.isModal())
-        self.assertIn("保存", dialog.stage.text())
-        self.assertEqual(dialog.progress.maximum(), 0)
-        # Closing the popup or pressing Esc must not hide an active operation.
-        dialog.close()
+        window.show_save_progress("正在保存录制数据…", sink.path)
+        dialog = window.save_dialog
         dialog.reject()
         self.assertTrue(dialog.isVisible())
-        window.connection = None
-        def export(_):
-            entered.set()
-            if not release.wait(5):
-                raise RuntimeError("test timed out")
-            return dict(source=str(source), destination=str(source.parent/"export"))
-        with patch("imu_viewer.gui.export_recording", side_effect=export):
-            try:
-                done.set()
-                window.finish_recording()
-                self.pump_until(entered.is_set)
-                self.assertIs(window.export_dialog, dialog)
-                self.assertIn("正在导出", dialog.stage.text())
-                # The Qt event loop stays responsive throughout background export.
-                fired = []
-                QtCore.QTimer.singleShot(0, lambda: fired.append(True))
-                self.pump_until(lambda: bool(fired))
-            finally:
-                release.set()
-                self.pump_until(lambda: not window.busy)
-        self.assertEqual(finished, [QtWidgets.QDialog.Accepted])
-        self.assertIsNone(window.export_dialog)
+        with patch.object(window, "task") as task:
+            window.finish_recording()
+            self.assertIs(window.recorder, sink)
+            done.set()
+            window.finish_recording()
+            window.finish_recording()
+            task.assert_not_called()
+        self.assertIsNone(window.recorder)
+        self.assertIsNone(window.save_dialog)
+        self.assertFalse(dialog.isVisible())
+        self.assertIn("保存完成", window.save_status.text())
+        self.assertIn("imu_image.csv", window.save_status.text())
+        self.assertFalse(hasattr(window, "export_button"))
+        self.assertFalse(hasattr(window, "begin_export"))
 
-    def test_failed_export_popup_stays_visible_and_retry_replaces_it(self):
+    def test_failure_explicit_closable_and_not_false_success(self):
         window = self.window()
-        window.show()
-        with patch("imu_viewer.gui.export_recording", side_effect=OSError("disk full")):
-            window.begin_export(Path("session/raw"))
-            self.pump_until(lambda: not window.busy)
-        failed = window.export_dialog
-        self.assertTrue(failed.isVisible())
-        self.assertFalse(failed.running)
-        self.assertIn("导出失败", failed.stage.text())
-        self.assertIn("disk full", failed.details.text())
-        self.assertTrue(failed.close_button.isVisible())
-        failed.close()
-        self.assertFalse(failed.isVisible())
-        with patch("imu_viewer.gui.export_recording", return_value=dict(source="raw", destination="export")):
-            window.begin_export(Path("session/raw"))
-            self.assertIsNot(window.export_dialog, failed)
-            self.assertTrue(window.export_dialog.isVisible())
-            self.pump_until(lambda: not window.busy)
-        self.assertIsNone(window.export_dialog)
+        done = threading.Event()
+        done.set()
+        window.recorder = SimpleNamespace(done=done, path=Path("session/raw"),
+                                          error="Finalization: disk full", report={})
+        window.finish_recording()
+        dialog = window.save_dialog
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.windowTitle(), "保存失败")
+        self.assertIn("disk full", dialog.details.text())
+        self.assertIn("可能不完整", dialog.hint.text())
+        self.assertIn("保存失败", window.save_status.text())
+        self.assertTrue(dialog.close_button.isEnabled())
+        dialog.close_button.click()
+        self.assertFalse(dialog.isVisible())
 
-    def test_export_failure_visible_and_retry_clears_only_export_error(self):
+    def test_complete_button_stops_recording_but_keeps_connection(self):
         window = self.window()
-        window.show()
-        with patch("imu_viewer.gui.export_recording",side_effect=OSError("space full")):
-            window.begin_export(Path("session/raw"))
-            self.pump_until(lambda:not window.busy)
-        self.assertIsNone(window.last_export)
-        self.assertTrue(window.error_banner.isVisible())
-        self.assertIn("space full",window.export_status.text())
-        self.assertTrue(window.export_button.isEnabled())
-        with patch("imu_viewer.gui.export_recording",return_value=dict(source="raw",destination="exports/result")):
-            window.begin_export(Path("session/raw"))
-            self.assertFalse(window.error_banner.isVisible())
-            self.pump_until(lambda:not window.busy)
-        window.error_banner.setText("recording failed")
-        window.error_banner.show()
-        with patch("imu_viewer.gui.export_recording",return_value=dict(source="raw",destination="exports/result_001")):
-            window.begin_export(Path("session/raw"))
-            self.pump_until(lambda:not window.busy)
-        self.assertTrue(window.error_banner.isVisible())
-        self.assertEqual(window.error_banner.text(),"recording failed")
+        done = threading.Event()
+        window.recorder = SimpleNamespace(done=done, path=Path("session/raw"), stop_event=threading.Event())
+        connection = Mock()
+        window.connection = connection
+        with patch.object(window, "set_recording_controls"):
+            window.stop_recording()
+        connection.stop_recording.assert_called_once()
+        connection.stop.assert_not_called()
+        self.assertTrue(window.save_dialog.isVisible())
+        window.save_dialog.complete("test cleanup")
 
 
-class AutoExportCliTests(unittest.TestCase):
-    def test_cli_waits_before_export_and_passes_session(self):
-        source = Path("recordings/session/raw").resolve()
+class SaveCliTests(unittest.TestCase):
+    def run_record(self, error=None, wait=True):
         events = []
         recorder = Mock()
-        recorder.start.return_value = source
+        recorder.start.return_value = Path("recordings/session/raw").resolve()
         recorder.done.wait.return_value = True
-        recorder.wait.side_effect = lambda timeout: events.append("wait") or True
+        recorder.wait.side_effect = lambda timeout: events.append("wait") or wait
         recorder.stop.side_effect = lambda: events.append("stop")
         recorder.report = {}
         recorder.snapshot.return_value = {}
-        recorder.error = None
-        def export(path):
-            self.assertEqual(events,["stop","wait"])
-            self.assertEqual(path,source)
-            events.append("export")
-            return {}
-        with patch("sys.argv",["imu_viewer","record","--output","raw"]), \
-             patch("imu_viewer.__main__.select_port",return_value=dict(port="FAKE",serial_number="UNIT")), \
-             patch("imu_viewer.__main__.camera_inventory",return_value=[]), \
-             patch("imu_viewer.__main__.Recorder",return_value=recorder) as factory, \
-             patch("imu_viewer.__main__.export_recording",side_effect=export), \
-             patch("sys.stdout",new_callable=io.StringIO):
-            self.assertEqual(main(),0)
-        self.assertEqual(events,["stop","wait","export"])
-        self.assertIsInstance(factory.call_args.args[0].output,str)
-        self.assertEqual(factory.call_args.args[0].output,str(Path("raw").resolve()))
+        recorder.error = error
+        with patch("sys.argv", ["imu_viewer","record","--output","viewer/recordings"]), \
+             patch("imu_viewer.__main__.select_port", return_value=dict(port="FAKE", serial_number="UNIT")), \
+             patch("imu_viewer.__main__.camera_inventory", return_value=[]), \
+             patch("imu_viewer.__main__.Recorder", return_value=recorder), \
+             patch("imu_viewer.storage.export_euroc", side_effect=AssertionError("no export")), \
+             patch("sys.stdout", new_callable=io.StringIO) as output, \
+             patch("sys.stderr", new_callable=io.StringIO) as errors:
+            result = main()
+        self.assertEqual(events, ["stop","wait"])
+        return result, output.getvalue(), errors.getvalue()
 
-    def test_cli_rejects_empty_root_before_opening_hardware(self):
-        with patch("sys.argv",["imu_viewer","record","--output"," "]), \
+    def test_record_save_only_and_failure_exit_status(self):
+        result, output, errors = self.run_record()
+        self.assertEqual(result, 0)
+        self.assertIn("imu_image.csv", output)
+        self.assertNotIn("export", output.lower())
+        result, output, errors = self.run_record(error="Writer: disk full")
+        self.assertEqual(result, 2)
+        self.assertIn("保存失败", errors)
+        result, output, errors = self.run_record(wait=False)
+        self.assertEqual(result, 2)
+        self.assertIn("timed out", errors)
+
+    def test_cli_export_removed_and_empty_root_rejected_before_hardware(self):
+        with patch("sys.argv", ["imu_viewer","export","a","b"]), \
+             patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as error:
+            main()
+        self.assertEqual(error.exception.code, 2)
+        with patch("sys.argv", ["imu_viewer","record","--output"," "]), \
              patch("imu_viewer.__main__.select_port") as select, \
-             patch("sys.stderr",new_callable=io.StringIO):
-            self.assertEqual(main(),2)
+             patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(main(), 2)
             select.assert_not_called()
-
-    def test_cli_export_failure_returns_error(self):
-        recorder = Mock()
-        recorder.start.return_value = Path("raw/session")
-        recorder.done.wait.return_value = recorder.wait.return_value = True
-        with patch("sys.argv",["imu_viewer","record","--output","raw"]), \
-             patch("imu_viewer.__main__.select_port",return_value=dict(port="FAKE",serial_number="UNIT")), \
-             patch("imu_viewer.__main__.camera_inventory",return_value=[]), \
-             patch("imu_viewer.__main__.Recorder",return_value=recorder), \
-             patch("imu_viewer.__main__.export_recording",side_effect=OSError("disk full")), \
-             patch("sys.stdout",new_callable=io.StringIO), patch("sys.stderr",new_callable=io.StringIO):
-            self.assertEqual(main(),2)
 
 
 if __name__ == "__main__":

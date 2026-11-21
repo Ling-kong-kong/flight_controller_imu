@@ -1,6 +1,6 @@
 """Live attitude display; history is independent of the GUI runtime."""
 from PySide6 import QtCore, QtWidgets
-import pyqtgraph as pg
+from .waveform import WaveformPanel
 
 
 class AttitudePanel(QtWidgets.QWidget):
@@ -8,33 +8,49 @@ class AttitudePanel(QtWidgets.QWidget):
         super().__init__()
         self.history = None
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         self.state = QtWidgets.QLabel("姿态：未连接")
         self.values = QtWidgets.QLabel("roll / pitch / yaw：— / — / — °")
         self.quaternion = QtWidgets.QLabel("四元数 qw,qx,qy,qz：—")
         self.quaternion.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.addWidget(self.state)
+        status_row.addWidget(self.values, 1)
+        layout.addLayout(status_row)
+        layout.addWidget(self.quaternion)
+        note = QtWidgets.QLabel("FRD → NED · 相对航向（实验磁辅助状态见上，非磁北）· 安装方向待实板核验")
+        note.setWordWrap(True)
+        note.setToolTip("Euler 3-2-1；yaw 静置校准归零。安装旋转暂定 X/Z 取反，必须实板核验。"
+                        "连接历史最近 10 秒完整，早期为各分量独立峰值，不是有效的合并四元数。")
         for label in (self.state, self.values, self.quaternion):
             label.setWordWrap(True)
-            layout.addWidget(label)
-        note = QtWidgets.QLabel("FRD → NED · Euler 3-2-1 · yaw 静置校准归零、允许漂移（无磁力计）\n安装旋转暂定 X/Z 取反，必须实板核验。趋势仅保留最近 10,000 点。")
-        note.setWordWrap(True)
         layout.addWidget(note)
-        self.plot = pg.PlotWidget()
-        self.plot.setLabel("left", "角度", units="°")
-        self.plot.setLabel("bottom", "H743 相对时间", units="s")
-        self.plot.addLegend()
-        self.curves = [self.plot.plot(pen=pg.mkPen(c, width=1.5), name=n, connect="finite")
-                       for c,n in zip(("#ffb454", "#7edbaf", "#78b9ff"), ("roll", "pitch", "yaw"))]
-        layout.addWidget(self.plot, 1)
+        self.waveforms = WaveformPanel(chart_specs=(
+            ("欧拉角", "°", (1, 2, 3), ("roll", "pitch", "yaw")),
+            ("四元数", "", (4, 5, 6, 7), ("qw", "qx", "qy", "qz"))))
+        self.euler_chart, self.quaternion_chart = self.waveforms.charts
+        # Compatibility aliases for the old Euler plot, not a separate renderer.
+        self.plot, self.curves = self.euler_chart.plot, self.euler_chart.curves
+        layout.addWidget(self.waveforms, 1)
 
     def refresh(self, history=None, connected=False, recalibrating=False):
-        if history is not None:
+        if history is not None and history is not self.history:
             self.history = history
+            self.waveforms.set_history(history.waveforms)
         if self.history is None:
             return
-        f, live, rows = self.history.snapshot(connected)
+        f, live = self.history.status(connected)
         valid = live and f is not None and f.attitude_valid and not recalibrating
         if valid:
-            self.state.setText("姿态：有效 · 相对航向")
+            # A missing bit is not proof that magnetic firmware was disabled.
+            mag = f.flags & 0xe000
+            magnetic = ("磁标志异常" if mag not in (0, 16384, 16384 | 32768, 8192 | 32768)
+                        else "磁辅助中" if mag & 8192
+                        else "磁拒绝 / 六轴积分" if mag & 16384 and mag & 32768
+                        else "磁等待 / 六轴积分" if mag & 16384
+                        else "未报告磁状态")
+            self.state.setText("姿态：有效 · 相对航向 · " + magnetic)
             self.values.setText(f"roll / pitch / yaw：{f.roll_deg:.2f} / {f.pitch_deg:.2f} / {f.yaw_deg:.2f} °")
             self.quaternion.setText("四元数 qw,qx,qy,qz：" + ", ".join(f"{v:.6f}" for v in (f.qw,f.qx,f.qy,f.qz)))
         else:
@@ -44,10 +60,13 @@ class AttitudePanel(QtWidgets.QWidget):
             self.state.setText("姿态：" + state)
             self.values.setText("roll / pitch / yaw：— / — / — °")
             self.quaternion.setText("四元数 qw,qx,qy,qz：—")
-        for i, curve in enumerate(self.curves):
-            curve.setData(rows[:,0], rows[:,i+1])
-        if len(rows):
-            self.plot.setXRange(max(0, rows[-1,0]-10), max(10, rows[-1,0]), padding=0)
+
+    def shutdown(self):
+        self.waveforms.shutdown()
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
 
 
 class AttitudeDetailsDialog(QtWidgets.QDialog):

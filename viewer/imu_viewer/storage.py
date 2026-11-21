@@ -1,4 +1,4 @@
-"""Append-only raw session storage and reproducible finalization/export."""
+"""Append-only raw session storage and reproducible saved associations."""
 import csv
 from dataclasses import asdict
 import json
@@ -7,7 +7,8 @@ from pathlib import Path
 import shutil
 import time
 import cv2
-from .protocol import ATTITUDE_FIELDS, Frame, Parser, ControlReply
+from .protocol import ATTITUDE_FIELDS, Frame, Parser, ControlReply, FusionDiagnostic
+from .recalibration import finite_json
 from .clock import WARNING, fit_clock, align_camera
 from .timing import HOST_WARNING, TIME_BASIS, iter_host_imu, match_images, image_filename
 
@@ -58,8 +59,16 @@ class SessionWriter:
                 imu_protocol="IMU2 v3/type3/76 bytes (v2 offline supported)",
                 attitude_coordinates=dict(body="FRD", world="NED", quaternion="qw,qx,qy,qz body-to-world",
                                           euler="3-2-1 roll,pitch,yaw degrees"),
-                attitude_heading="relative yaw zeroed at stationary calibration; drift allowed; no magnetometer",
-                manual_recalibration="IMU2 control v1/32 bytes; executed ACK is not completion; events.jsonl records yaw reference boundaries; raw six-axis and timestamps continue",
+                attitude_heading="relative yaw zeroed at stationary calibration; optional experimental magnetic drift aiding, not magnetic north; drift remains possible",
+                magnetic_heading=dict(mode="unknown from connection; inspect each v3 frame flags",
+                    flags={"8192": "mag_heading_aiding", "16384": "mag_heading_rejected",
+                           "32768": "mag_heading_reference"},
+                    absent_flags="not reported; does not prove disabled",
+                    rejected="magnetic correction suspended; six-axis attitude may remain valid",
+                    reference="preserved across magnetic rejection and USB reconnect; cleared by fusion reset/recalibration",
+                    installation="experimental BMM150 diag(-1,-1,+1), NOT hardware accepted"),
+                manual_recalibration="IMU2 control v1/32 bytes; op1 full bias/gravity + magnetic wait, op2 heading zero preserves bias/reference/gates; executed ACK is not completion; events.jsonl records yaw reference boundaries; raw six-axis and timestamps continue",
+                fusion_diagnostics="IMU2 v1/type0x12/56 bytes, latest-only 10 Hz; phase0 stationary,1 magnetic wait,2 reference established,3 six-axis fallback; phase2 does not guarantee current magnetic aiding; stale/missing diagnostic means unknown",
                 attitude_installation="provisional ROTATION_PITCH_180; physical axes NOT yet verified",
                 attitude_invalid="attitude_valid=0; quaternion and Euler CSV columns blank",
                 config=asdict(config), state="recording",
@@ -100,21 +109,28 @@ class SessionWriter:
         self.control_parser.feed(raw)
         for record in self.control_parser.records:
             if isinstance(record, ControlReply):
-                key = (record.request_id, record.timestamp_us, record.sequence)
+                key = (record.request_id, record.operation, record.timestamp_us, record.sequence)
                 if key == self.last_control:
                     continue  # Cached ACK retry is not another yaw-reference change.
                 self.last_control = key
-                self.event("imu_recalibration_executed", dict(request_id=record.request_id,
+                self.event("imu_heading_zero_executed" if record.operation == 2 else "imu_recalibration_executed",
+                           dict(request_id=record.request_id, operation=record.operation,
                            status=record.status, timestamp_us=record.timestamp_us, sequence=record.sequence))
                 if record.status == 0:
-                    self.yaw_pending = dict(request_id=record.request_id, timestamp_us=record.timestamp_us,
+                    if self.yaw_pending is not None:
+                        self.event("imu_yaw_reference_superseded", dict(boundary=self.yaw_pending,
+                                   superseded_by_request_id=record.request_id))
+                    self.yaw_pending = dict(request_id=record.request_id, operation=record.operation, timestamp_us=record.timestamp_us,
                                             sequence=record.sequence)
-            elif record.protocol_version == 3:
+            elif isinstance(record, FusionDiagnostic):
+                self.event("imu_fusion_diagnostic", finite_json(dict(asdict(record), reason_name=record.reason_name)))
+            elif isinstance(record, Frame) and record.protocol_version == 3:
                 if record.flags & (1024 | 4096) and self.yaw_pending is None:
                     self.yaw_pending = dict(request_id=None, timestamp_us=record.timestamp_us,
                                             sequence=record.sequence)
                 if (self.yaw_pending is not None and record.attitude_valid and
-                        record.timestamp_us >= self.yaw_pending["timestamp_us"]):
+                        record.timestamp_us >= self.yaw_pending["timestamp_us"] and
+                        ((record.sequence - self.yaw_pending["sequence"]) & 0xffffffff) < 0x80000000):
                     self.event("imu_yaw_reference_valid", dict(boundary=self.yaw_pending,
                                first_valid_timestamp_us=record.timestamp_us, first_valid_sequence=record.sequence))
                     self.yaw_pending = None
@@ -170,6 +186,13 @@ def finalize(path, quality=None):
     session = json.loads((path / "session.json").read_text(encoding="utf-8"))
     if quality is None and session.get("state") == "recording":
         raise ValueError("Session is active or was interrupted; do not finalize an open recording")
+    # Invalidate stale success before rebuilding any derived indexes. A failed
+    # finalization must never leave a session advertised as complete.
+    session["finalized"] = False
+    if quality is not None:
+        session["state"] = "stopped_error" if quality.get("error") else "stopped"
+        json_write(path / "quality.json", quality)
+    json_write(path / "session.json", session)
     if session.get("timestamp_basis") == TIME_BASIS:
         return _finalize_host(path, session, quality)
     persisted_quality = quality
@@ -230,6 +253,7 @@ def finalize(path, quality=None):
         json_write(path / "quality.json", quality)
     session = json.loads((path / "session.json").read_text(encoding="utf-8"))
     session["state"] = ("stopped_error" if quality.get("error") else "stopped") if quality is not None else session.get("state", "recovered")
+    save_associations(path, frames)
     session["finalized"] = True
     json_write(path / "session.json", session)
     return report
@@ -266,9 +290,77 @@ def _finalize_host(path, session, quality):
     if quality is not None:
         json_write(path / "quality.json", quality)
         session["state"] = "stopped_error" if quality.get("error") else "stopped"
+    save_associations(path, frames)
     session["finalized"] = True
     json_write(path / "session.json", session)
     return report
+
+
+
+def save_associations(path, frames, tolerance_ns=20_000_000):
+    """Save every IMU row with optional original stereo paths, without image I/O.
+
+    Host read completion is the association axis, not sensor/exposure time.
+    Independent original indexes remain authoritative for unmatched images.
+    """
+    path = Path(path)
+    associations = match_images(iter_host_imu(path), frames, tolerance_ns)
+    with (path / "imu.csv").open(newline="", encoding="utf-8") as f:
+        fields = next(csv.reader(f), []) or IMU_FIELDS
+    if "unified_timestamp_ns" not in fields:
+        fields = fields + ["unified_timestamp_ns"]
+    image_fields = ["image_frame_id", "image_timestamp_ns", "image_minus_imu_ns", "cam0", "cam1"]
+    raw_fields = [k for k in ("ax_raw", "ay_raw", "az_raw", "gx_raw", "gy_raw", "gz_raw") if k in fields]
+    attitude_fields = [k for k in (*ATTITUDE_FIELDS, "attitude_valid") if k in fields]
+    supplemental = [k for k in fields if k not in raw_fields and k not in attitude_fields]
+    joined_fields = raw_fields + image_fields + attitude_fields + supplemental
+    destination = path / "imu_image.csv"
+    temporary = destination.with_suffix(".csv.tmp")
+    count = 0
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as f:
+            out = csv.DictWriter(f, joined_fields)
+            out.writeheader()
+            for source_row in iter_host_imu(path):
+                row = dict(source_row)
+                image = associations.get(int(row["sample_id"]))
+                if image is not None:
+                    row.update(image_frame_id=image["frame_id"],
+                               image_timestamp_ns=image["host_read_end_ns"],
+                               image_minus_imu_ns=int(image["host_read_end_ns"]) -
+                                                  int(row["unified_timestamp_ns"]),
+                               cam0=image["cam0"], cam1=image["cam1"])
+                out.writerow(row)
+                count += 1
+            f.flush()
+            os.fsync(f.fileno())
+        temporary.replace(destination)
+    except BaseException:
+        # Leave any previous complete table untouched; finalized remains false.
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    metadata = dict(
+        schema_version=1, table="imu_image.csv", timestamp_basis=TIME_BASIS,
+        timestamp_source="each IMU's USB batch host_read_end_ns",
+        device_time="timestamp_us and timestamp_ns (integer microseconds * 1000), unchanged",
+        warning=HOST_WARNING, exposure_sync_accuracy_ns=None,
+        association_rule="camera-ordered nearest remaining IMU; one-to-one; ties to earliest sample",
+        match_tolerance_ns=tolerance_ns, imu_rows=count,
+        matched_imu_rows=len(associations), unmatched_imu_rows=count-len(associations),
+        image_frames=len(frames), unmatched_image_frames=len(frames)-len(associations),
+        unmatched_image_index="frames.csv; all original stereo PNGs retained",
+        image_paths="relative to this raw directory; original color PNGs, not copied or re-encoded",
+        missing_image="all five image columns blank",
+        missing_attitude="all seven quaternion/Euler columns blank; validity flags preserved",
+        attitude_source="same firmware IMU frame, not resampled or inferred from images",
+        duplicate_timestamps="preserved: USB batches may contain multiple IMU frames",
+        column_groups=dict(raw_six_axis=raw_fields, image=image_fields,
+                           attitude=attitude_fields, provenance=supplemental))
+    json_write(path / "association.json", metadata)
+    return metadata
 
 
 def export_euroc(source, destination, match_tolerance_ns=20_000_000):

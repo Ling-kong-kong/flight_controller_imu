@@ -42,11 +42,11 @@ class FirmwareNativeTests(unittest.TestCase):
         cls.build = tempfile.TemporaryDirectory(prefix="imu-native-")
         cls.library = Path(cls.build.name) / "stream.so"
         command = [shutil.which("cc"), "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-                   "-fPIC", "-shared",
+                   "-fPIC", "-shared", f"-DFUSION_MAG_ENABLE={int(getattr(cls, 'magnetic', False))}",
                    "-I", str(ROOT / "tests/native"), "-I", str(ROOT / "firmware/include"),
                    str(ROOT / "tests/native/stream_harness.c"),
                    str(ROOT / "firmware/src/protocol.c"), str(ROOT / "firmware/src/stream.c"),
-                   str(ROOT / "firmware/src/fusion.c"), "-lm", "-o", str(cls.library)]
+                   str(ROOT / "firmware/src/fusion.c"), str(ROOT / "firmware/src/mag_heading.c"), "-lm", "-o", str(cls.library)]
         if os.name != "nt":
             command[1:1] = ["-fsanitize=undefined", "-fno-sanitize-recover=undefined"]
         subprocess.run(command, check=True, capture_output=True, text=True)
@@ -130,10 +130,15 @@ class FirmwareNativeTests(unittest.TestCase):
     def frames(self):
         parser = imu.StreamParser()
         frames = []
+        records = []
         wire = self.wire()
         for start in range(0, len(wire), 17):
             frames.extend(parser.feed(wire[start:start + 17]))
-        self.assertEqual(len(wire) % 76, 0)
+            records.extend(parser.records)
+        self.assertEqual(len(wire), sum(len(r.encode()) for r in records))
+        self.assertTrue(all(isinstance(r, (imu.PairedFrame, imu.FusionDiagnostic))
+                            for r in records))
+        frames = [r for r in frames if isinstance(r, imu.PairedFrame)]
         self.assertEqual(parser.crc_errors, 0)
         self.assertEqual(parser.header_errors, 0)
         self.assertEqual(parser.bytes_discarded, 0)
@@ -165,7 +170,11 @@ class FirmwareNativeTests(unittest.TestCase):
         self.usb_pump(available=72)
         self.assertEqual(self.wire()[76:], latest.encode())
         self.usb_pump()
-        self.assertEqual(len(self.wire()), 148)  # Slot consumed, never repeated.
+        parser = imu.StreamParser()
+        parser.feed(self.wire())
+        self.assertEqual([r for r in parser.records if isinstance(r, imu.MagFrame)], [latest])
+        self.assertEqual(sum(isinstance(r, imu.FusionDiagnostic) for r in parser.records), 1)
+        self.assertEqual(len(self.wire()), 204)  # IMU + mag + diagnostic, no repeats.
 
     def test_mag_session_discards_pending_and_disconnected_samples(self):
         self.assertFalse(self.publish_mag(1)[1])
@@ -666,14 +675,17 @@ class AttitudeNativeTests(unittest.TestCase):
         # No absolute heading observation: residual z bias is allowed to drift.
         self.assertAlmostEqual(self.attitude()[6],2,delta=.06)
 
-    def test_gravity_feedback_converges_and_variance_gates_correction(self):
+    def test_gravity_feedback_converges_despite_runtime_accel_variance(self):
         self.calibrate()
         for _ in range(500):
             self.update(a=(0,0,-2),g=(60,0,0))
         self.assertAlmostEqual(self.attitude()[4],30,delta=.05)
         for i in range(1000):
             self.update(a=((.15 if i%2 else -.15),0,-.989))
-        self.assertAlmostEqual(self.attitude()[4],30,delta=.1)
+        # Near-unit norm noise no longer blocks runtime gravity feedback.
+        # With Kp=2, the initial 30-degree roll decays to about 4 degrees in 1 s.
+        self.assertGreater(self.attitude()[4],3.)
+        self.assertLess(self.attitude()[4],6.)
         for _ in range(3000):
             self.update()
         self.assertLess(abs(self.attitude()[4]),.2)
@@ -746,11 +758,15 @@ class AttitudeNativeTests(unittest.TestCase):
         self.lib.mock_process_at(t-1000)
         self.assertGreater(self.lib.mock_fusion_resets(), resets)
         first = None
+        parser = imu.StreamParser()
+        offset = len(self.wire())
         for i in range(2250):
             self.stream_static(t)
             self.usb_pump()
-            # Decode only the latest wire frame (the full capture is tested below).
-            f = imu.StreamParser().feed(self.wire()[-76:])[0]
+            # Diagnostics may follow the IMU frame; decode the new mixed bytes.
+            wire = self.wire()
+            f = parser.feed(wire[offset:])[-1]
+            offset = len(wire)
             if f.attitude_valid and first is None:
                 first = i
             t += 1000

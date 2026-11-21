@@ -165,3 +165,10 @@ void mock_encode_v3(uint8_t *out) {
     const attitude_t q = {.q={1,0,0,0},.euler={0,0,90},.valid=true};
     imu_encode_frame(out,0x12345678,0x123456789abcdef0ULL,a,g,624,499,0x0800,321,&q);
 }
+
+/* Submit through the real stream fusion path, independent of USB TX. */
+void mock_submit_mag(uint64_t t, uint32_t seq, const float *ut, uint16_t flags, uint8_t error) {
+    const magnetic_sample_t m = {.timestamp_us=t, .sequence=seq,
+        .chip_ut={ut[0],ut[1],ut[2]}, .flags=flags, .error=error};
+    stream_magnetic_sample(&m);
+}

@@ -10,6 +10,7 @@ _Static_assert((IMU_HISTORY_CAPACITY & (IMU_HISTORY_CAPACITY - 1u)) == 0u,
                "History capacity must be a power of two");
 
 volatile imu_diagnostics_t g_imu_diagnostics;
+volatile mag_heading_diagnostics_t g_mag_fusion_diagnostics;
 volatile uint8_t g_last_imu_frame[IMU_FRAME_SIZE];
 typedef struct {
     uint64_t timestamp_us;
@@ -51,22 +52,31 @@ static volatile uint32_t fusion_head, fusion_tail;
 static volatile bool fusion_overflow;
 static uint32_t session;
 static fusion_t fusion;
+void stream_magnetic_sample(const magnetic_sample_t *sample)
+{
+    fusion_submit_mag(&fusion, sample);
+    g_mag_fusion_diagnostics = fusion.magnetic.diagnostics;
+}
 /* Main-context-only control state; ISR only advances fusion_head. */
 static uint8_t control_rx[IMU_CONTROL_SIZE], control_reply[IMU_CONTROL_SIZE];
 static unsigned control_used;
-static uint32_t control_id, control_boundary;
+static uint32_t control_id, control_boundary, control_operation, calibration_id;
+static uint8_t fusion_diag_pending[IMU_FUSION_DIAG_SIZE];
+static bool fusion_diag_ready;
+static uint64_t fusion_diag_time;
 static bool control_requested, control_reply_ready, control_cached;
 
 static void control_receive(uint8_t byte)
 {
     control_rx[control_used++] = byte;
     if (control_used < IMU_CONTROL_SIZE) return;
-    uint32_t id;
-    if (imu_decode_recalibrate(control_rx, &id)) {
-        if (control_cached && id == control_id) {
+    uint32_t id, operation;
+    if (imu_decode_control(control_rx, &id, &operation)) {
+        if (control_cached && id == control_id && operation == control_operation) {
             control_reply_ready = true; /* Retry ACK, never repeat the reset. */
         } else if (!control_requested && !control_reply_ready) {
             control_id = id;
+            control_operation = operation;
             control_boundary = fusion_head; /* Exclude the entire old backlog. */
             control_requested = true;
             control_cached = false;
@@ -95,6 +105,8 @@ void stream_set_active(bool enabled)
     sequence = 0;
     ++session;
     mag_pending_ready = false;
+    fusion_diag_ready = false;
+    fusion_diag_time = 0;
     control_used = 0;
     control_requested = control_reply_ready = control_cached = false;
     pending_flags = enabled ? IMU_FLAG_SESSION : 0u;
@@ -258,6 +270,8 @@ void stream_process_task(void)
             fusion_overflow = false;
             __set_PRIMASK(saved);
             fusion_reset(&fusion);
+            fusion_diag_ready = false;
+            g_mag_fusion_diagnostics = fusion.magnetic.diagnostics;
             g_imu_diagnostics.fusion_resets = fusion.resets;
             return;
         }
@@ -267,7 +281,11 @@ void stream_process_task(void)
              * every idle pass, and preserve the pending reset event. */
             const uint64_t now = board_micros();
             if (fusion.started && now > fusion.previous_tick &&
-                now-fusion.previous_tick > 10000u) fusion_reset(&fusion);
+                now-fusion.previous_tick > 10000u) {
+                fusion_reset(&fusion);
+                fusion_diag_ready = false;
+            }
+            g_mag_fusion_diagnostics = fusion.magnetic.diagnostics;
             g_imu_diagnostics.fusion_resets = fusion.resets;
             return;
         }
@@ -275,19 +293,32 @@ void stream_process_task(void)
         sample = fusion_queue[fusion_tail % IMU_FUSION_QUEUE_CAPACITY];
         ++fusion_tail;
         __set_PRIMASK(saved);
-        if (control_requested && (int32_t)(sample_index-control_boundary) >= 0) {
+        const bool execute = control_requested && (int32_t)(sample_index-control_boundary) >= 0;
+        if (execute && control_operation == 1u) {
             fusion_reset(&fusion);
-            imu_encode_control_reply(control_reply, control_id, sample.time, sample.sequence);
-            control_requested = false;
-            control_cached = control_reply_ready = true;
+            calibration_id = control_id;
         }
         fusion_update(&fusion, sample.time, sample.accel, sample.gyro,
                       sample.age[0], sample.age[1], sample.flags);
+        if (execute) {
+            const unsigned status = control_operation == 2u ? fusion_heading_zero(&fusion) : 0u;
+            imu_encode_operation_reply(control_reply, control_id, control_operation, status,
+                                       sample.time, sample.sequence);
+            control_requested = false;
+            control_cached = control_reply_ready = true;
+        }
+        uint8_t diagnostic[IMU_FUSION_DIAG_SIZE];
+        const bool publish_diag = active && (execute || sample.time-fusion_diag_time >= 100000u);
+        if (publish_diag) {
+            imu_encode_fusion_diagnostics(diagnostic, &fusion, sample.time,
+                                         sample.sequence, calibration_id);
+        }
         /* An ISR may have overflowed while floating-point work ran. The next
          * pass discards backlog and resets; do not publish this result. */
         if (fusion_overflow) continue;
         g_imu_diagnostics.fusion_resets = fusion.resets;
-        uint16_t flags = sample.flags;
+        g_mag_fusion_diagnostics = fusion.magnetic.diagnostics;
+        uint16_t flags = sample.flags | fusion_magnetic_flags(&fusion);
         if (fusion.attitude.calibrating) flags |= IMU_FLAG_CALIBRATING;
         if (fusion.attitude.valid) flags |= IMU_FLAG_ATTITUDE_VALID;
         if (fusion.attitude.reset) flags |= IMU_FLAG_FUSION_RESET;
@@ -306,6 +337,11 @@ void stream_process_task(void)
         if (!sample.send || !active || sample.session != session) {
             __set_PRIMASK(publish_saved);
             continue;
+        }
+        if (publish_diag) {
+            memcpy(fusion_diag_pending, diagnostic, sizeof(diagnostic));
+            fusion_diag_time = sample.time;
+            fusion_diag_ready = true; /* Publish only after the overflow recheck. */
         }
         const uint32_t head = produced;
         const uint32_t used = head-consumed;
@@ -378,6 +414,12 @@ void stream_usb_task(void)
         if (tud_cdc_write(mag_pending, STREAM_MAG_SIZE) != STREAM_MAG_SIZE)
             board_fatal(8u);
         mag_pending_ready = false;
+    }
+    if (fusion_diag_ready && consumed == produced &&
+        tud_cdc_write_available() >= IMU_FUSION_DIAG_SIZE) {
+        if (tud_cdc_write(fusion_diag_pending, IMU_FUSION_DIAG_SIZE) != IMU_FUSION_DIAG_SIZE)
+            board_fatal(8u);
+        fusion_diag_ready = false;
     }
     (void)tud_cdc_write_flush();
 }

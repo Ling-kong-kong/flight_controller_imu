@@ -8,12 +8,23 @@ PACKET = struct.Struct("<4sBBHIQhhhhhhIIHHI")
 PACKET_V3 = struct.Struct("<4sBBHIQhhhhhhIIHH7fI")
 MAG_PACKET = struct.Struct("<4sBBHIQhhhHfffHBBBBBBIIIIII")
 CONTROL = struct.Struct("<4sBBHIIQII")
+FUSION_DIAGNOSTIC = struct.Struct("<4sBBHQIIIIIffIII")
+assert FUSION_DIAGNOSTIC.size == 56
+MAG_REASONS = ("waiting", "ok", "imu", "motion", "quality", "time", "sequence",
+               "stale", "overflow", "norm", "horizontal", "tilt_reserved", "dip",
+               "innovation", "unstable")
 ATTITUDE_FIELDS = ("qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg")
 FLAGS = {1: "output_timing", 2: "accel_spi_error", 4: "gyro_spi_error",
          8: "ring_overflow", 16: "session_start", 32: "accel_stale",
          64: "gyro_stale", 128: "accel_drdy_anomaly",
          256: "gyro_drdy_anomaly", 512: "history_missing", 1024: "calibrating",
-         2048: "attitude_valid", 4096: "fusion_reset"}
+         2048: "attitude_valid", 4096: "fusion_reset",
+         8192: "mag_heading_aiding", 16384: "mag_heading_rejected",
+         32768: "mag_heading_reference"}
+
+# Only raw sensor/acquisition errors invalidate the six-axis display. Calibration,
+# fusion and magnetic-heading status flags describe attitude, not raw sensor data.
+RAW_IMU_INVALID_FLAGS = (2 | 4 | 8 | 32 | 64 | 128 | 256 | 512)
 
 @dataclass(frozen=True)
 class Frame:
@@ -84,8 +95,34 @@ class ControlReply:
     timestamp_us: int
     sequence: int
 
+    operation: int = 1
+
     def encode(self):
-        return _control_packet(0x11, self.request_id, self.status, self.timestamp_us, self.sequence)
+        return _control_packet(0x13 if self.operation == 2 else 0x11, self.request_id, self.status, self.timestamp_us, self.sequence)
+
+
+
+@dataclass(frozen=True)
+class FusionDiagnostic:
+    timestamp_us: int
+    sequence: int
+    phase: int
+    reason: int
+    recovery_count: int
+    recovery_elapsed_ms: int
+    innovation_deg: float
+    correction_rate_dps: float
+    flags: int
+    request_id: int
+
+    @property
+    def reason_name(self):
+        return MAG_REASONS[self.reason] if 0 <= self.reason < len(MAG_REASONS) else "unknown"
+
+    def encode(self):
+        values = [getattr(self, key) for key in self.__dataclass_fields__]
+        raw = FUSION_DIAGNOSTIC.pack(b"IMU2", 1, 0x12, 56, *values, 0)
+        return raw[:-4] + struct.pack("<I", zlib.crc32(raw[:-4]))
 
 
 def _control_packet(kind, request_id, value, timestamp_us=0, sequence=0):
@@ -100,12 +137,18 @@ def recalibrate_command(request_id):
     return _control_packet(0x10, request_id, 1)
 
 
+def heading_zero_command(request_id):
+    if not 0 < request_id <= 0xffffffff:
+        raise ValueError("Nonzero uint32 request ID required")
+    return _control_packet(0x10, request_id, 2)
+
+
 class Parser:
     def __init__(self):
         self.buffer = bytearray()
         self.records = []
         self.stats = dict(bytes_received=0, bytes_discarded=0,
-                          crc_errors=0, header_errors=0, frames=0, control_replies=0, mag_frames=0)
+                          crc_errors=0, header_errors=0, frames=0, control_replies=0, mag_frames=0, fusion_diagnostics=0)
 
     def feed(self, data):
         self.stats["bytes_received"] += len(data)
@@ -122,13 +165,15 @@ class Parser:
                 self._discard(i)
                 if len(self.buffer) < 8:
                     break
-                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00", b"\x01\x11\x20\x00", b"\x01\x04\x48\x00"):
+                if bytes(self.buffer[4:8]) not in (b"\x02\x03\x30\x00", b"\x03\x03\x4c\x00", b"\x01\x11\x20\x00", b"\x01\x13\x20\x00", b"\x01\x12\x38\x00", b"\x01\x04\x48\x00"):
                     self.stats["header_errors"] += 1
                     self._discard(1)
                     continue
                 codec = CONTROL if self.buffer[4] == 1 else (PACKET_V3 if self.buffer[4] == 3 else PACKET)
                 if self.buffer[5] == 4:
                     codec = MAG_PACKET
+                if self.buffer[5] == 0x12:
+                    codec = FUSION_DIAGNOSTIC
                 if len(self.buffer) < codec.size:
                     break
                 packet = bytes(self.buffer[:codec.size])
@@ -142,8 +187,12 @@ class Parser:
                     # Independent diagnostic stream; never pass to IMU recording/control.
                     self.stats["mag_frames"] += 1
                     continue
+                if codec is FUSION_DIAGNOSTIC:
+                    self.records.append(FusionDiagnostic(*fields[4:-1]))
+                    self.stats["fusion_diagnostics"] += 1
+                    continue
                 if codec is CONTROL:
-                    self.records.append(ControlReply(*fields[4:-1]))
+                    self.records.append(ControlReply(*fields[4:-1], operation=2 if fields[2] == 0x13 else 1))
                     self.stats["control_replies"] += 1
                     continue
                 result.append(Frame(*fields[4:16], protocol_version=fields[1],

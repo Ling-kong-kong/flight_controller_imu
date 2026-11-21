@@ -79,7 +79,7 @@ class HistoryTests(unittest.TestCase):
         h = WaveformHistory(recent_s=.001)
         ts = np.arange(9, dtype=np.uint64)*1000+1_000_000
         seq = np.array([0xfffffffe,0xffffffff,0,2,3,4,5,6,7],np.uint32)
-        flags = np.array([16,1,0,0,2,0,0,0x8000,0], np.uint16)
+        flags = np.array([16,1,0,0,2,0,0,64,0], np.uint16)
         invalid = np.array([False]*6+[True,False,False])
         h.append_arrays(ts, np.tile(np.arange(9,dtype=np.int16)[:,None],(1,6)), seq,flags,invalid)
         _, curves = render_history(h, 0, .008, 100)

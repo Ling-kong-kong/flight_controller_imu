@@ -32,6 +32,15 @@ def sample(seq=1, **changes):
 
 
 class MagHostTests(unittest.TestCase):
+    def test_metadata_does_not_mislabel_optional_magnetic_aiding(self):
+        capture = mag.Capture()
+        capture.feed(sample().encode())
+        summary = capture.summary()
+        self.assertIn("raw magnetic frames", summary["axes"])
+        self.assertIn("raw magnetic frames", summary["magnetic_calibration"])
+        self.assertIn("IMU v3 flags", summary["yaw"])
+        self.assertIn("no north reference", summary["yaw"])
+
     def test_mixed_split_corrupt_resync(self):
         a = imu.PairedFrame(0, 100000, 0, 0, 1365, 0, 0, 0, 100, 100)
         b = imu.PairedFrame(1, 101000, 0, 0, 1365, 0, 0, 0, 100, 100,
@@ -124,6 +133,24 @@ class MagNativeTests(unittest.TestCase):
         p.feed(b''.join(bytes(self.c.mock_frame(i)[:72]) for i in range(self.c.mock_count())))
         self.assertEqual(p.crc_errors,0)
         return p.records
+
+    def test_direct_fusion_submission_matches_wire_even_for_errors(self):
+        class Sample(ctypes.Structure):
+            _fields_ = [('timestamp_us', ctypes.c_uint64), ('sequence', ctypes.c_uint32),
+                        ('chip_ut', ctypes.c_float*3), ('flags', ctypes.c_uint16),
+                        ('error', ctypes.c_uint8)]
+        self.c.mock_magnetic.restype = ctypes.POINTER(Sample)
+        self.c.mock_run(1000000)
+        self.c.mock_faults(1)
+        self.c.mock_run(1100000)
+        frames = self.frames()
+        self.assertEqual(len(frames), self.c.mock_submitted())
+        self.assertTrue(any(not f.valid for f in frames))
+        for i, f in enumerate(frames):
+            direct = self.c.mock_magnetic(i).contents
+            self.assertEqual((direct.timestamp_us, direct.sequence, direct.flags, direct.error),
+                             (f.timestamp_us, f.sequence, f.flags, f.error))
+            self.assertEqual(list(direct.chip_ut), [f.x_ut, f.y_ut, f.z_ut])
 
     def test_normal_configuration_ready_and_crc(self):
         self.c.mock_run(1000000)

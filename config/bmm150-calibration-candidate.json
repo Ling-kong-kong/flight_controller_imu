@@ -1,0 +1,42 @@
+{
+  "schema": "bmm150-integration-candidate-v1",
+  "status": "candidate_only",
+  "scope": "Board-specific hard/soft iron correction; not a firmware default or heading acceptance",
+  "input_axes": "BMM150 chip/register axes; mounting rotation NOT applied",
+  "formula": "corrected_uT = correction_matrix @ (measured_uT - bias_ut)",
+  "scale_semantics": "determinant-one correction; absolute field strength not established",
+  "bias_ut": [
+    -20.51479880648215,
+    -14.69928811135179,
+    -4.728956550836864
+  ],
+  "correction_matrix": [
+    [
+      1.0079481866451447,
+      -0.005386536906908035,
+      0.002291617838467617
+    ],
+    [
+      -0.005386536906908059,
+      0.9825200371420542,
+      -0.010625394151918972
+    ],
+    [
+      0.0022916178384676197,
+      -0.010625394151918925,
+      1.0099145875143967
+    ]
+  ],
+  "reference_norm_ut": 47.889600586206996,
+  "mounting_rotation_to_frd": null,
+  "mounting_rotation_verified": false,
+  "firmware_applied": false,
+  "magnetic_heading_fused": false,
+  "source_candidate_sha256": "2ef9ac08ca40a6a7d9563343cfda3850f9bee04494a576cdbe1b85c17107061e",
+  "integration_order": [
+    "verify_magnetic_to_imu_axes",
+    "add_abnormal_field_and_freshness_gates",
+    "validate_tilt_compensation_and_relative_yaw_drift_suppression"
+  ],
+  "heading_semantics": "Startup-zeroed relative yaw; not magnetic north or true north"
+}

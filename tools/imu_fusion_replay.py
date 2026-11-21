@@ -9,6 +9,7 @@ proof of hardware attitude accuracy. Legacy IMU1 cannot supply paired inputs.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 import csv
 import hashlib
@@ -21,9 +22,9 @@ import subprocess
 import tempfile
 
 try:
-    from .imu_capture import ATTITUDE_FIELDS, ControlReply, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
+    from .imu_capture import ATTITUDE_FIELDS, MagFrame, ControlReply, FusionDiagnostic, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
 except ImportError:
-    from imu_capture import ATTITUDE_FIELDS, ControlReply, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
+    from imu_capture import ATTITUDE_FIELDS, MagFrame, ControlReply, FusionDiagnostic, PairedFrame, SensorStats, StreamParser, FLAG_NAMES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,7 +39,8 @@ def sha256(path):
 
 class NativeFusion:
     """Temporary native build of supplied real firmware sources, with provenance."""
-    def __init__(self, source, include, compiler=None):
+    def __init__(self, source, include, compiler=None, magnetic=False):
+        self.magnetic = magnetic
         self.source, self.include = Path(source).resolve(), Path(include).resolve()
         self.env = os.environ.copy()
         if os.name == 'nt':
@@ -51,11 +53,16 @@ class NativeFusion:
         try:
             library = Path(self.temp.name) / ('fusion.dll' if os.name == 'nt' else 'fusion.so')
             command = [self.compiler, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
-                       '-fPIC', '-shared', '-I', str(self.include),
+                       '-fPIC', '-shared', f'-DFUSION_MAG_ENABLE={int(magnetic)}', '-I', str(self.include),
                        '-I', str(ROOT/'firmware/include'), str(ROOT/'tools/native/fusion_replay.c'),
-                       str(self.source), '-lm', '-o', str(library)]
+                       str(self.source), str(self.source.parent/'mag_heading.c'), '-lm', '-o', str(library)]
             subprocess.run(command, env=self.env, check=True, capture_output=True, text=True)
             self.provenance = {
+                'magnetic_enabled': magnetic,
+                'mag_heading_source_sha256': sha256(self.source.parent/'mag_heading.c'),
+                'mag_heading_header_sha256': sha256(self.include/'mag_heading.h'),
+                'mag_calibration_header_sha256': sha256(self.include/'mag_calibration.h'),
+                'candidate_config_sha256': sha256(ROOT/'config/bmm150-calibration-candidate.json'),
                 'fusion_source': str(self.source), 'fusion_source_sha256': sha256(self.source),
                 'fusion_header': str(self.include/'fusion.h'),
                 'fusion_header_sha256': sha256(self.include/'fusion.h'),
@@ -78,10 +85,36 @@ class NativeFusion:
             self.lib.replay_resets.restype = ctypes.c_uint
             self.lib.replay_recalibrate.argtypes = []
             self.lib.replay_recalibrate.restype = None
+            self.lib.replay_calibration_phase.argtypes = []
+            self.lib.replay_calibration_phase.restype = ctypes.c_uint
+            self.lib.replay_heading_zero.argtypes = []
+            self.lib.replay_heading_zero.restype = ctypes.c_uint
+            self.lib.replay_mag.argtypes = [ctypes.c_uint64, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_uint16, ctypes.c_uint8]
+            self.lib.replay_mag.restype = None
+            self.lib.replay_magnetic.argtypes = [ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_float)]
+            self.lib.replay_magnetic.restype = None
             self.lib.replay_reset()
         except BaseException:
             self.close()
             raise
+
+    def submit_mag(self, frame):
+        ut = (ctypes.c_float*3)(frame.x_ut, frame.y_ut, frame.z_ut)
+        # Preserve errors; malformed diagnostic metadata must also stop aiding.
+        flags = frame.flags if frame.valid else frame.flags & ~1
+        self.lib.replay_mag(frame.timestamp_us, frame.sequence, ut, flags, frame.error)
+
+    def magnetic_diagnostics(self):
+        reasons = ['waiting', 'ok', 'imu', 'motion', 'quality', 'time', 'sequence',
+                   'stale', 'overflow', 'norm', 'horizontal', 'tilt', 'dip', 'innovation', 'unstable']
+        counts = (ctypes.c_uint32*(9+len(reasons)))()
+        values = (ctypes.c_float*3)()
+        self.lib.replay_magnetic(counts, values)
+        return dict(zip(['submitted', 'accepted', 'rejected', 'overflows', 'aid_ticks',
+                         'references', 'reason_index', 'reference_ready', 'aiding'], counts[:9]),
+                    reason=reasons[counts[6]], reason_transitions=dict(zip(reasons, counts[9:])),
+                    innovation_deg=values[0], reference_offset_deg=values[1], reference_dip_deg=values[2])
 
     def update(self, frame):
         a = (ctypes.c_int16*3)(frame.ax, frame.ay, frame.az)
@@ -90,9 +123,12 @@ class NativeFusion:
         # bits are the old firmware's output, NOT replay control instructions.
         flags = self.lib.replay_update(frame.timestamp_us, a, g, frame.accel_age_us,
                                        frame.gyro_age_us, frame.flags & 0x3ff)
+        return flags, self.read_values()
+
+    def read_values(self):
         values = (ctypes.c_float*10)()
         self.lib.replay_values(values)
-        return flags, list(values)
+        return list(values)
 
     def close(self):
         if self.lib is not None:
@@ -141,18 +177,35 @@ def replay(path, native, writer=None, chunk_size=65536):
     transitions = []  # bounded even for a damaged/long capture
     transition_count = 0
     last_values = None
-    pending_boundary = None
+    pending_boundaries = deque()  # ACKs can precede older queued IMU records.
     last_control = None
-    manual_resets = 0
+    manual_resets = heading_zeros = 0
+    magnetic_records = late_magnetic_records = magnetic_aiding_frames = magnetic_rejected_frames = 0
+    max_arrival_lag_us = 0
     with Path(path).open('rb') as handle:
         for chunk in iter(lambda: handle.read(chunk_size), b''):
             parser.feed(chunk)
             for f in parser.records:
+                if isinstance(f, MagFrame):
+                    magnetic_records += 1
+                    # Conservative bounded-memory wire-order replay: never move
+                    # observations backwards over reboot/control boundaries.
+                    # A late USB magnetic record is consumed at the NEXT IMU tick.
+                    if last_t is not None and f.timestamp_us < last_t:
+                        late_magnetic_records += 1
+                        max_arrival_lag_us = max(max_arrival_lag_us, last_t-f.timestamp_us)
+                    if native.magnetic:
+                        native.submit_mag(f)
+                    continue
                 if isinstance(f, ControlReply):
-                    key = (f.request_id, f.timestamp_us, f.sequence)
+                    key = (f.request_id, f.operation, f.timestamp_us, f.sequence)
                     if f.status == 0 and key != last_control:
-                        pending_boundary = f.timestamp_us
+                        if len(pending_boundaries) >= 64:
+                            raise ValueError("Too many pending control boundaries (limit 64)")
+                        pending_boundaries.append(f)
                         last_control = key
+                    continue
+                if isinstance(f, FusionDiagnostic):
                     continue
                 if not isinstance(f, PairedFrame):
                     nonpaired += 1
@@ -163,12 +216,26 @@ def replay(path, native, writer=None, chunk_size=65536):
                     first_t = f.timestamp_us
                 last_t = f.timestamp_us
                 recorded_valid += int(f.attitude_valid)
-                if pending_boundary is not None and f.timestamp_us >= pending_boundary:
+                def boundary_due(boundary):
+                    return (f.timestamp_us >= boundary.timestamp_us and
+                            ((f.sequence-boundary.sequence) & 0xffffffff) < 0x80000000)
+                execute = bool(pending_boundaries and boundary_due(pending_boundaries[0]))
+                pending_boundary = pending_boundaries[0] if execute else None
+                if execute and len(pending_boundaries) > 1 and boundary_due(pending_boundaries[1]):
+                    raise ValueError("Multiple control boundaries without execution samples; cannot replay faithfully")
+                if execute and pending_boundary.operation == 1:
                     native.lib.replay_recalibrate()
                     manual_resets += 1
-                    pending_boundary = None
                 flags, values = native.update(f)
+                if execute:
+                    if pending_boundary.operation == 2:
+                        if native.lib.replay_heading_zero() == 0:
+                            heading_zeros += 1
+                            values = native.read_values()
+                    pending_boundaries.popleft()
                 last_values = values
+                magnetic_aiding_frames += bool(flags & 8192)
+                magnetic_rejected_frames += bool(flags & 16384)
                 is_valid = bool(flags & 2048) and not flags & (1024 | 4096)
                 calibrating += bool(flags & 1024)
                 resets += bool(flags & 4096)
@@ -193,6 +260,11 @@ def replay(path, native, writer=None, chunk_size=65536):
     if not frames:
         raise ValueError('No paired IMU2 v2/v3 frames found (IMU1 is not replayable)')
     return {
+        'magnetic': dict(enabled=native.magnetic, records=magnetic_records,
+            late_records=late_magnetic_records, max_arrival_lag_us=max_arrival_lag_us,
+            aiding_frames=magnetic_aiding_frames, rejected_frames=magnetic_rejected_frames,
+            final_state_since_last_fusion_reset=native.magnetic_diagnostics(),
+            ordering='bounded-memory USB wire order; delayed observations use current IMU attitude, not timestamp-interpolated attitude; not board-exact'),
         'input': str(Path(path).resolve()), 'input_sha256': sha256(path),
         'parser': parser.summary(), 'nonpaired_frames_skipped': nonpaired,
         'paired_frames': frames, 'recorded_valid_attitude_frames': recorded_valid,
@@ -206,6 +278,8 @@ def replay(path, native, writer=None, chunk_size=65536):
         'valid_frames': valid, 'invalid_frames': frames-valid,
         'calibrating_frames': calibrating, 'reset_flag_frames': resets,
         'manual_recalibrations_applied': manual_resets,
+        'heading_zeros_applied': heading_zeros,
+        'control_boundaries_without_samples': len(pending_boundaries),
         'fusion_resets_including_initial': native.lib.replay_resets(),
         'first_valid_elapsed_s': first_valid, 'last_valid_elapsed_s': last_valid,
         'validity_transition_count': transition_count, 'validity_transitions': transitions,
@@ -224,6 +298,7 @@ def main(argv=None):
     parser.add_argument('--csv', type=Path, help='Optional replay output, invalid attitudes blank')
     parser.add_argument('--fusion-source', type=Path, default=ROOT/'firmware/src/fusion.c')
     parser.add_argument('--fusion-include', type=Path, default=ROOT/'firmware/include')
+    parser.add_argument('--magnetic', action='store_true', help='Enable experimental candidate magnetic yaw aiding (default OFF)')
     parser.add_argument('--cc', help='Native GCC/Clang executable, NOT arm-none-eabi-gcc')
     args = parser.parse_args(argv)
     outputs = [p.resolve() for p in (args.report, args.csv) if p]
@@ -231,11 +306,13 @@ def main(argv=None):
                                      args.fusion_include/'fusion.h', Path(__file__),
                                      ROOT/'tools/native/fusion_replay.c',
                                      ROOT/'firmware/include/stream.h',
-                                     ROOT/'tools/imu_capture.py')}
+                                     ROOT/'tools/imu_capture.py', args.fusion_source.parent/'mag_heading.c',
+                                     args.fusion_include/'mag_heading.h', args.fusion_include/'mag_calibration.h',
+                                     ROOT/'config/bmm150-calibration-candidate.json')}
     if len(set(outputs)) != len(outputs) or protected.intersection(outputs):
         parser.error('Output paths must be distinct and must not overwrite inputs or sources')
     import contextlib
-    with NativeFusion(args.fusion_source, args.fusion_include, args.cc) as native:
+    with NativeFusion(args.fusion_source, args.fusion_include, args.cc, magnetic=args.magnetic) as native:
         with (args.csv.open('w', newline='', encoding='utf-8') if args.csv else contextlib.nullcontext()) as handle:
             writer = csv.writer(handle) if handle else None
             if writer:

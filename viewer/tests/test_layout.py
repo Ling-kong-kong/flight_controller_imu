@@ -71,7 +71,7 @@ class LayoutTests(unittest.TestCase):
                 self.assertEqual(window.waveforms.chart_splitter.orientation(),
                                  QtCore.Qt.Vertical if wide else QtCore.Qt.Horizontal)
                 for control in (window.ports, window.connect_button, window.disconnect_button,
-                                window.start_button, window.stop_button, window.export_button,
+                                window.start_button, window.stop_button,
                                 window.preview_label, window.waveforms):
                     rect = QtCore.QRect(control.mapTo(window.centralWidget(), QtCore.QPoint()), control.size())
                     self.assertTrue(window.centralWidget().rect().contains(rect), (control, rect))
@@ -89,6 +89,48 @@ class LayoutTests(unittest.TestCase):
             self.app.processEvents()
             self.assertTrue(window.preview_label.stacked)
             self.assertEqual(window.waveforms.chart_splitter.orientation(), QtCore.Qt.Vertical)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_attitude_active_tab_fits_and_resize_preserves_navigation(self):
+        with patch.object(Window, 'refresh_devices'):
+            window = Window()
+        try:
+            window.telemetry_tabs.setCurrentWidget(window.attitude_panel)
+            deck = window.attitude_panel.waveforms
+            deck.manual()
+            deck.set_range(2, 7)
+            t = np.linspace(2, 7, 1000)
+            for chart in deck.charts:
+                for axis, curve in enumerate(chart.curves):
+                    curve.setData(t, .5*np.sin(t*(axis+1)))
+            window.show()
+            parent = Path(__file__).resolve().parents[1]/'test-results'
+            parent.mkdir(exist_ok=True)
+            for width, height, wide in ((1440, 960, True), (1024, 720, False), (1360, 900, True)):
+                # Let Qt recalculate wrapped-label minima and the responsive
+                # splitter orientation at the new width before reducing height.
+                window.resize(width, window.height())
+                self.app.processEvents()
+                window.resize(width, height)
+                for _ in range(4):
+                    self.app.processEvents()
+                self.assertEqual((window.width(), window.height()), (width, height))
+                self.assertFalse(deck.follow)
+                self.assertEqual(deck.chart_splitter.orientation(),
+                                 QtCore.Qt.Vertical if wide else QtCore.Qt.Horizontal)
+                controls = [deck, deck.state, deck.time_span_spin, *deck.charts,
+                            *deck.findChildren(QtWidgets.QPushButton)]
+                for control in controls:
+                    self.assertTrue(control.isVisible())
+                    rect = QtCore.QRect(control.mapTo(window.centralWidget(), QtCore.QPoint()), control.size())
+                    self.assertTrue(window.centralWidget().rect().contains(rect), (control, rect))
+                for chart in deck.charts:
+                    np.testing.assert_allclose(chart.view.viewRange()[0], (2, 7), atol=1e-8)
+                    self.assertGreater(chart.plot.width(), 100)
+                    self.assertGreater(chart.plot.height(), 80)
+                self.assertTrue(window.grab().save(str(parent/f'attitude-layout-{width}x{height}.png')))
         finally:
             window.close()
             self.app.processEvents()

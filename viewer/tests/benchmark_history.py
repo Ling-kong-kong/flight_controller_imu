@@ -16,6 +16,7 @@ import numpy as np
 import psutil
 from PySide6 import QtCore, QtGui, QtWidgets
 from imu_viewer.history import WaveformHistory, render_history
+from imu_viewer.attitude_history import AttitudeHistory
 from imu_viewer.protocol import Frame
 from imu_viewer.waveform import WaveformPanel
 
@@ -30,20 +31,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, default=3_600_000)
     parser.add_argument("--batch", type=int, default=86)
-    parser.add_argument("--output", default="test-results/waveform-benchmark.json")
+    parser.add_argument("--attitude", action="store_true", help="Benchmark seven attitude components")
+    parser.add_argument("--output", default=None)
     args = parser.parse_args()
     process = psutil.Process()
     rss_initial = process.memory_info().rss
     rss_peak = rss_initial
-    history = WaveformHistory()
+    history = (WaveformHistory(channels=7, value_dtype="<f8", scales=[1.]*7)
+               if args.attitude else WaveformHistory())
     latencies = []
     started = time.perf_counter()
     for start in range(0, args.samples, args.batch):
         ix = np.arange(start, min(start+args.batch, args.samples), dtype=np.uint64)
         t = 1_000_000+ix*1000
-        v = ((ix[:, None]*np.array([13, 17, 19, 23, 29, 31], np.uint64)) % 60001).astype(np.int32)-30000
+        if args.attitude:
+            phase = ix.astype(float)*.001
+            v = np.column_stack((20*np.sin(phase), 10*np.cos(phase), 40*np.sin(phase*.1),
+                                 np.cos(phase*.5), np.zeros(len(ix)), np.zeros(len(ix)),
+                                 np.sin(phase*.5)))
+        else:
+            v = (((ix[:, None]*np.array([13, 17, 19, 23, 29, 31], np.uint64))
+                  % 60001).astype(np.int32)-30000).astype(np.int16)
         before = time.perf_counter()
-        history.append_arrays(t, v.astype(np.int16), ix.astype(np.uint32))
+        history.append_arrays(t, v, ix.astype(np.uint32),
+                              validity=np.ones(len(ix), bool) if args.attitude else None)
         latencies.append(time.perf_counter()-before)
         if start % (args.batch*100) == 0:
             rss_peak = max(rss_peak, process.memory_info().rss)
@@ -63,17 +74,21 @@ def main():
             rss_peak = max(rss_peak, process.memory_info().rss)
         render[name] = {**stats(durations), "points_per_axis": [len(x) for x, y in series]}
     # Include conversion from actual parsed Frame objects at the USB-batch size.
-    small = WaveformHistory()
+    small = AttitudeHistory() if args.attitude else WaveformHistory()
     frame_latencies = []
     for start in range(0, 86_000, 86):
-        frames = [Frame(i, 1_000_000+i*1000, 1, 2, 3, 4, 5, 6, 10, 10)
+        attitude = (dict(flags=2048, protocol_version=3, qw=1., qx=0., qy=0., qz=0.,
+                         roll_deg=0., pitch_deg=0., yaw_deg=0.) if args.attitude else {})
+        frames = [Frame(i, 1_000_000+i*1000, 1, 2, 3, 4, 5, 6, 10, 10, **attitude)
                   for i in range(start, start+86)]
         before = time.perf_counter()
         small.append_frames(frames)
         frame_latencies.append(time.perf_counter()-before)
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    panel = WaveformPanel()
+    panel = WaveformPanel(chart_specs=(
+        ("Euler", "deg", (1, 2, 3), ("roll", "pitch", "yaw")),
+        ("Quaternion", "", (4, 5, 6, 7), ("qw", "qx", "qy", "qz")))) if args.attitude else WaveformPanel()
     panel.resize(1360, 520)
     panel.show()
     panel.set_history(history)
@@ -91,7 +106,7 @@ def main():
         last = now
         ticks += 1
         if ticks % 10 == 0:
-            chart = panel.accel_chart
+            chart = panel.primary_chart
             pos = chart.plot.mapFromScene(chart.view.sceneBoundingRect().center())
             point = QtCore.QPointF(pos)
             event = QtGui.QWheelEvent(point, QtCore.QPointF(chart.plot.mapToGlobal(pos)),
@@ -116,6 +131,7 @@ def main():
     report = {
         "kind": "synthetic_not_hardware_acceptance", "platform": platform.platform(),
         "python": platform.python_version(), "numpy": np.__version__,
+        "mode": "attitude_7_components" if args.attitude else "raw_six_axis",
         "samples": args.samples, "rate_hz": 1000, "duration_s": info.duration,
         "batch_size": args.batch, "ingestion_wall_s": ingestion_s,
         "append_arrays": stats(latencies), "append_86_frames": stats(frame_latencies),
@@ -128,7 +144,8 @@ def main():
                   "not a physical mouse or display-latency measurement",
                   "history budget excludes transient rendering arrays and Qt/process RSS",
                   "timings depend on machine load; no long hardware acceptance claimed"]}
-    path = Path(args.output)
+    path = Path(args.output or ("test-results/attitude-waveform-benchmark.json" if args.attitude
+                                else "test-results/waveform-benchmark.json"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf8")
     print(json.dumps(report, indent=2, ensure_ascii=False))

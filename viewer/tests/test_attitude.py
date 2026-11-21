@@ -149,6 +149,23 @@ class AttitudeWidgetTests(unittest.TestCase):
         finally:
             panel.close()
 
+    def test_magnetic_states_do_not_hide_valid_six_axis_attitude(self):
+        panel, history = AttitudePanel(), AttitudeHistory()
+        try:
+            states = [(8192 | 32768, "磁辅助中"), (16384 | 32768, "磁拒绝"),
+                      (16384, "磁等待"), (0, "未报告磁状态"),
+                      (8192 | 16384 | 32768, "磁标志异常"),
+                      (8192, "磁标志异常"), (32768, "磁标志异常")]
+            for i, (flags, expected) in enumerate(states):
+                with self.subTest(flags=flags):
+                    history.append_frames([frame(i, flags=2048 | flags, yaw_deg=12.5)])
+                    panel.refresh(history, True)
+                    self.assertIn(expected, panel.state.text())
+                    self.assertIn("12.50", panel.values.text())
+                    self.assertIn("1.000000", panel.quaternion.text())
+        finally:
+            panel.close()
+
     def test_recording_details_pagination_and_invalid_hiding(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)
@@ -188,7 +205,8 @@ class AttitudeStorageTests(unittest.TestCase):
         writer = SessionWriter(path, Config(port="FAKE", width=8, height=4))
         for i in range(6):
             f = frame(i, protocol_version=2 if i == 0 else 3,
-                      flags=16 if i == 0 else 1024 if i == 1 else 2048)
+                      flags=(16, 1024, 2048 | 8192 | 32768, 2048 | 16384 | 32768,
+                             2048 | 16384, 2048)[i])
             raw = f.encode()
             decoded = Parser().feed(raw)
             end = 5000000000+i*1000000
@@ -209,6 +227,9 @@ class AttitudeStorageTests(unittest.TestCase):
             self.assertEqual(row["attitude_valid"], "0")
             self.assertEqual([row[k] for k in ATTITUDE_FIELDS], [""]*7)
         self.assertEqual(rows[2]["qw"], "1.0")
+        self.assertEqual([int(row["flags"]) & 0xe000 for row in rows[2:]],
+                         [8192 | 32768, 16384 | 32768, 16384, 0])
+        self.assertTrue(all(row["attitude_valid"] == "1" for row in rows[2:]))
         metadata = json.loads((path/"session.json").read_text(encoding="utf8"))
         self.assertEqual(metadata["schema_version"], 3)
         self.assertEqual(metadata["attitude_coordinates"]["body"], "FRD")

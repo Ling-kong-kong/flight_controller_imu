@@ -1,4 +1,5 @@
 #include "mag.h"
+#include "stream.h"
 #include "board_i2c.h"
 #include <string.h>
 #include <stdlib.h>
@@ -9,6 +10,12 @@ static uint8_t regs[256], last_reg, length, *buffer;
 static bool reading, pending;
 static unsigned faults, frame_count;
 static uint8_t output[128][72];
+static magnetic_sample_t submitted[128];
+static unsigned submitted_count;
+void stream_magnetic_sample(const magnetic_sample_t *sample)
+{ submitted[submitted_count++%128] = *sample; }
+unsigned mock_submitted(void) { return submitted_count; }
+const magnetic_sample_t *mock_magnetic(unsigned i) { return &submitted[i%128]; }
 uint64_t board_micros(void) { return now; }
 _Noreturn void board_fatal(unsigned code) { (void)code; abort(); }
 static void set16(unsigned r, uint16_t v) { regs[r]=(uint8_t)v; regs[r+1]=(uint8_t)(v>>8); }
@@ -82,7 +89,7 @@ int board_i2c_poll(void)
     }
     return 1;
 }
-bool stream_publish_mag(const uint8_t *p)
+bool stream_publish_mag(const uint8_t p[STREAM_MAG_SIZE])
 {
     memcpy(output[frame_count++%128],p,72);
     return false;

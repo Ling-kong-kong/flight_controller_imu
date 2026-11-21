@@ -56,7 +56,15 @@ static void publish(uint64_t now, uint16_t flags, const int16_t raw[3], uint16_t
                     const float ut[3])
 {
     uint8_t frame[MAG_FRAME_SIZE]={ 'I','M','U','2',1,4,72,0 };
-    put32(frame+8,g_mag_diagnostics.sequence++);
+    const uint32_t sequence = g_mag_diagnostics.sequence++;
+    const magnetic_sample_t sample = {
+        .timestamp_us=now, .sequence=sequence,
+        .chip_ut={ut ? ut[0] : 0.0f, ut ? ut[1] : 0.0f, ut ? ut[2] : 0.0f},
+        .flags=flags, .error=g_mag_diagnostics.error
+    };
+    /* Feed fusion directly even without DTR. The USB slot is NOT an input. */
+    stream_magnetic_sample(&sample);
+    put32(frame+8,sequence);
     put32(frame+12,(uint32_t)now); put32(frame+16,(uint32_t)(now>>32));
     for (unsigned i=0; i<3u; ++i) {
         put16(frame+20+2*i,raw ? (uint16_t)raw[i] : 0u);
